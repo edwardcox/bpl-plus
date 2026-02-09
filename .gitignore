@@ -1,0 +1,14 @@
+# BPL+ (Go)
+bin/
+dist/
+*.exe
+*.out
+*.log
+
+# Editor / OS
+.vscode/
+.DS_Store
+
+# Local config / secrets (if any later)
+.env
+*.sqlite
