@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -151,9 +152,7 @@ func NewWithSource(filename string, source string) *Interpreter {
 	}
 }
 
-func New() *Interpreter {
-	return NewWithSource("", "")
-}
+func New() *Interpreter { return NewWithSource("", "") }
 
 func splitLinesPreserve(src string) []string {
 	if src == "" {
@@ -294,28 +293,6 @@ func (i *Interpreter) execStmt(s ast.Stmt) error {
 
 	case *ast.ForStmt:
 		return i.execFor(stmt)
-
-	case *ast.ForEachStmt:
-		iterVal, err := i.evalExpr(stmt.Iterable)
-		if err != nil {
-			return err
-		}
-		if iterVal.Kind != ValArray || iterVal.Arr == nil {
-			return i.runtimeErr(stmt.GetSpan(), "foreach requires an array on the right side of 'in'")
-		}
-
-		// Snapshot for predictable behavior if the array is mutated during iteration.
-		elems := iterVal.Arr.Elems
-		for idx, el := range elems {
-			i.currentEnv()[stmt.Var] = el
-			if stmt.IndexVar != "" {
-				i.currentEnv()[stmt.IndexVar] = NumberValue(float64(idx))
-			}
-			if err := i.Run(stmt.Body); err != nil {
-				return err
-			}
-		}
-		return nil
 
 	default:
 		span, ok := ast.SpanOf(s)
@@ -817,6 +794,65 @@ func (i *Interpreter) evalBuiltin(name string, argExprs []ast.Expr, callSpan ast
 		elems = elems[:len(elems)-1]
 		args[0].Arr.Elems = elems
 		return removed, nil
+
+	// --- File I/O (v0.3.0) ---
+	case "readfile":
+		if len(args) != 1 {
+			return Value{}, i.runtimeErr(callSpan, "readfile() expects 1 argument: readfile(path)")
+		}
+		path := args[0].ToString()
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return Value{}, i.runtimeErr(callSpan, fmt.Sprintf("readfile() failed for %q: %v", path, err))
+		}
+		return StringValue(string(data)), nil
+
+	case "writefile":
+		if len(args) != 2 {
+			return Value{}, i.runtimeErr(callSpan, "writefile() expects 2 arguments: writefile(path, content)")
+		}
+		path := args[0].ToString()
+		content := args[1].ToString()
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil && filepath.Dir(path) != "." {
+			return Value{}, i.runtimeErr(callSpan, fmt.Sprintf("writefile() could not create directories for %q: %v", path, err))
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			return Value{}, i.runtimeErr(callSpan, fmt.Sprintf("writefile() failed for %q: %v", path, err))
+		}
+		return NullValue(), nil
+
+	case "appendfile":
+		if len(args) != 2 {
+			return Value{}, i.runtimeErr(callSpan, "appendfile() expects 2 arguments: appendfile(path, content)")
+		}
+		path := args[0].ToString()
+		content := args[1].ToString()
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil && filepath.Dir(path) != "." {
+			return Value{}, i.runtimeErr(callSpan, fmt.Sprintf("appendfile() could not create directories for %q: %v", path, err))
+		}
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			return Value{}, i.runtimeErr(callSpan, fmt.Sprintf("appendfile() failed for %q: %v", path, err))
+		}
+		defer f.Close()
+		if _, err := f.WriteString(content); err != nil {
+			return Value{}, i.runtimeErr(callSpan, fmt.Sprintf("appendfile() write failed for %q: %v", path, err))
+		}
+		return NullValue(), nil
+
+	case "exists":
+		if len(args) != 1 {
+			return Value{}, i.runtimeErr(callSpan, "exists() expects 1 argument: exists(path)")
+		}
+		path := args[0].ToString()
+		_, err := os.Stat(path)
+		if err == nil {
+			return BoolValue(true), nil
+		}
+		if os.IsNotExist(err) {
+			return BoolValue(false), nil
+		}
+		return Value{}, i.runtimeErr(callSpan, fmt.Sprintf("exists() failed for %q: %v", path, err))
 
 	case "input":
 		if len(args) > 1 {
