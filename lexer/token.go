@@ -26,9 +26,7 @@ const (
 	TRUE     TokenType = "TRUE"
 	FALSE    TokenType = "FALSE"
 
-	// NEW: foreach sugar tokens
-	EACH TokenType = "EACH"
-	IN   TokenType = "IN"
+	IMPORT TokenType = "IMPORT"
 
 	AND TokenType = "AND"
 	OR  TokenType = "OR"
@@ -44,6 +42,11 @@ const (
 	RPAREN   TokenType = "RPAREN"
 	LBRACKET TokenType = "LBRACKET"
 	RBRACKET TokenType = "RBRACKET"
+
+	// Maps / objects
+	LBRACE TokenType = "LBRACE"
+	RBRACE TokenType = "RBRACE"
+	COLON  TokenType = "COLON"
 
 	COMMA TokenType = "COMMA"
 
@@ -100,11 +103,8 @@ func LookupIdent(ident string) TokenType {
 	case "false", "FALSE", "False":
 		return FALSE
 
-	// NEW: foreach keywords
-	case "each", "EACH", "Each":
-		return EACH
-	case "in", "IN", "In":
-		return IN
+	case "import", "IMPORT", "Import":
+		return IMPORT
 
 	case "and", "AND", "And":
 		return AND

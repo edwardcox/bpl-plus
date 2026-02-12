@@ -27,6 +27,8 @@ print (5 != 6)
 print ("5" == 5)
 print ("5" != 5)
 
+zz = input("prompt: ")
+
 print ("a" < "b")
 print ("a" <= "a")
 print ("b" > "a")

@@ -1,183 +1,97 @@
 package lexer
 
+import (
+	"strings"
+	"unicode"
+)
+
 type Lexer struct {
-	input []rune
-	pos   int
-	line  int
-	col   int
+	src  []rune
+	pos  int
+	line int
+	col  int
 }
 
 func New(input string) *Lexer {
+	input = strings.ReplaceAll(input, "\r\n", "\n")
+	input = strings.ReplaceAll(input, "\r", "\n")
 	return &Lexer{
-		input: []rune(input),
-		line:  1,
-		col:   1,
+		src:  []rune(input),
+		pos:  0,
+		line: 1,
+		col:  1,
 	}
-}
-
-func (l *Lexer) peek() rune {
-	if l.pos >= len(l.input) {
-		return 0
-	}
-	return l.input[l.pos]
-}
-
-func (l *Lexer) advance() rune {
-	ch := l.peek()
-	if ch == 0 {
-		return 0
-	}
-	l.pos++
-	if ch == '\n' {
-		l.line++
-		l.col = 1
-	} else {
-		l.col++
-	}
-	return ch
 }
 
 func (l *Lexer) NextToken() Token {
-	// skip spaces/tabs/carriage returns (not newline)
-	for {
-		ch := l.peek()
-		if ch == ' ' || ch == '\t' || ch == '\r' {
-			l.advance()
-			continue
-		}
-		break
+	l.skipWhitespaceExceptNewline()
+
+	if l.atEnd() {
+		return Token{Type: EOF, Line: l.line, Col: l.col}
 	}
 
-	startLine := l.line
-	startCol := l.col
 	ch := l.peek()
 
-	if ch == 0 {
-		return Token{Type: EOF, Line: startLine, Col: startCol}
-	}
-
+	// NEWLINE
 	if ch == '\n' {
-		l.advance()
-		return Token{Type: NEWLINE, Lexeme: "\n", Line: startLine, Col: startCol}
+		tok := Token{Type: NEWLINE, Line: l.line, Col: l.col}
+		l.advance() // consumes '\n'
+		l.line++
+		l.col = 1
+		return tok
 	}
 
-	// comment starting with '
-	if ch == '\'' {
-		for ch != 0 && ch != '\n' {
-			ch = l.advance()
-		}
+	// Comments: # ... to end of line
+	if ch == '#' {
+		l.skipComment()
 		return l.NextToken()
 	}
 
-	// identifiers/keywords
-	if isAlpha(ch) || ch == '_' {
-		lex := ""
-		for isAlphaNum(l.peek()) || l.peek() == '_' {
-			lex += string(l.advance())
-		}
-		tt := LookupIdent(lex)
-		return Token{Type: tt, Lexeme: lex, Line: startLine, Col: startCol}
+	// Ident / keyword
+	if isIdentStart(ch) {
+		startLine, startCol := l.line, l.col
+		ident := l.readIdent()
+		tt := LookupIdent(ident)
+		return Token{Type: tt, Lexeme: ident, Line: startLine, Col: startCol}
 	}
 
-	// numbers (int/float)
-	if isDigit(ch) {
-		lex := ""
-		dotSeen := false
-		for {
-			c := l.peek()
-			if isDigit(c) {
-				lex += string(l.advance())
-				continue
-			}
-			if c == '.' && !dotSeen {
-				dotSeen = true
-				lex += string(l.advance())
-				continue
-			}
-			break
-		}
-		return Token{Type: NUMBER, Lexeme: lex, Line: startLine, Col: startCol}
+	// Number
+	if unicode.IsDigit(ch) {
+		startLine, startCol := l.line, l.col
+		num := l.readNumber()
+		return Token{Type: NUMBER, Lexeme: num, Line: startLine, Col: startCol}
 	}
 
-	// strings "..."
+	// String
 	if ch == '"' {
-		l.advance()
-		lex := ""
-		for {
-			c := l.peek()
-			if c == 0 || c == '\n' {
-				return Token{Type: ILLEGAL, Lexeme: "Unterminated string", Line: startLine, Col: startCol}
-			}
-			if c == '"' {
-				l.advance()
-				break
-			}
-			if c == '\\' {
-				l.advance()
-				esc := l.peek()
-				if esc == 0 {
-					return Token{Type: ILLEGAL, Lexeme: "Bad escape", Line: startLine, Col: startCol}
-				}
-				switch esc {
-				case 'n':
-					l.advance()
-					lex += "\n"
-				case 't':
-					l.advance()
-					lex += "\t"
-				case '"':
-					l.advance()
-					lex += `"`
-				case '\\':
-					l.advance()
-					lex += `\`
-				default:
-					lex += string(esc)
-					l.advance()
-				}
-				continue
-			}
-			lex += string(l.advance())
+		startLine, startCol := l.line, l.col
+		s, ok := l.readString()
+		if !ok {
+			return Token{Type: ILLEGAL, Lexeme: "unterminated string", Line: startLine, Col: startCol}
 		}
-		return Token{Type: STRING, Lexeme: lex, Line: startLine, Col: startCol}
+		return Token{Type: STRING, Lexeme: s, Line: startLine, Col: startCol}
 	}
 
-	// two-char operators / assignment
-	if ch == '=' {
-		l.advance()
-		if l.peek() == '=' {
-			l.advance()
-			return Token{Type: EQ, Lexeme: "==", Line: startLine, Col: startCol}
-		}
-		return Token{Type: ASSIGN, Lexeme: "=", Line: startLine, Col: startCol}
+	// Two-char operators
+	if ch == '=' && l.peek2() == '=' {
+		return l.make2(EQ, "==")
 	}
-	if ch == '!' {
-		l.advance()
-		if l.peek() == '=' {
-			l.advance()
-			return Token{Type: NEQ, Lexeme: "!=", Line: startLine, Col: startCol}
-		}
-		return Token{Type: ILLEGAL, Lexeme: "!", Line: startLine, Col: startCol}
+	if ch == '!' && l.peek2() == '=' {
+		return l.make2(NEQ, "!=")
 	}
-	if ch == '<' {
-		l.advance()
-		if l.peek() == '=' {
-			l.advance()
-			return Token{Type: LTE, Lexeme: "<=", Line: startLine, Col: startCol}
-		}
-		return Token{Type: LT, Lexeme: "<", Line: startLine, Col: startCol}
+	if ch == '<' && l.peek2() == '=' {
+		return l.make2(LTE, "<=")
 	}
-	if ch == '>' {
-		l.advance()
-		if l.peek() == '=' {
-			l.advance()
-			return Token{Type: GTE, Lexeme: ">=", Line: startLine, Col: startCol}
-		}
-		return Token{Type: GT, Lexeme: ">", Line: startLine, Col: startCol}
+	if ch == '>' && l.peek2() == '=' {
+		return l.make2(GTE, ">=")
 	}
 
-	// single-char tokens
+	// Single-char tokens
+	startLine, startCol := l.line, l.col
 	switch ch {
+	case '=':
+		l.advance()
+		return Token{Type: ASSIGN, Lexeme: "=", Line: startLine, Col: startCol}
 	case '+':
 		l.advance()
 		return Token{Type: PLUS, Lexeme: "+", Line: startLine, Col: startCol}
@@ -202,23 +116,149 @@ func (l *Lexer) NextToken() Token {
 	case ']':
 		l.advance()
 		return Token{Type: RBRACKET, Lexeme: "]", Line: startLine, Col: startCol}
+	case '{':
+		l.advance()
+		return Token{Type: LBRACE, Lexeme: "{", Line: startLine, Col: startCol}
+	case '}':
+		l.advance()
+		return Token{Type: RBRACE, Lexeme: "}", Line: startLine, Col: startCol}
+	case ':':
+		l.advance()
+		return Token{Type: COLON, Lexeme: ":", Line: startLine, Col: startCol}
 	case ',':
 		l.advance()
 		return Token{Type: COMMA, Lexeme: ",", Line: startLine, Col: startCol}
+	case '<':
+		l.advance()
+		return Token{Type: LT, Lexeme: "<", Line: startLine, Col: startCol}
+	case '>':
+		l.advance()
+		return Token{Type: GT, Lexeme: ">", Line: startLine, Col: startCol}
+	default:
+		l.advance()
+		return Token{Type: ILLEGAL, Lexeme: string(ch), Line: startLine, Col: startCol}
+	}
+}
+
+func (l *Lexer) make2(t TokenType, lex string) Token {
+	startLine, startCol := l.line, l.col
+	l.advance()
+	l.advance()
+	return Token{Type: t, Lexeme: lex, Line: startLine, Col: startCol}
+}
+
+func (l *Lexer) skipWhitespaceExceptNewline() {
+	for !l.atEnd() {
+		ch := l.peek()
+		if ch == ' ' || ch == '\t' {
+			l.advance()
+			continue
+		}
+		break
+	}
+}
+
+func (l *Lexer) skipComment() {
+	for !l.atEnd() && l.peek() != '\n' {
+		l.advance()
+	}
+}
+
+func isIdentStart(r rune) bool {
+	return unicode.IsLetter(r) || r == '_'
+}
+
+func isIdentPart(r rune) bool {
+	return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_'
+}
+
+func (l *Lexer) readIdent() string {
+	var b strings.Builder
+	for !l.atEnd() && isIdentPart(l.peek()) {
+		b.WriteRune(l.peek())
+		l.advance()
+	}
+	return b.String()
+}
+
+func (l *Lexer) readNumber() string {
+	var b strings.Builder
+	for !l.atEnd() && unicode.IsDigit(l.peek()) {
+		b.WriteRune(l.peek())
+		l.advance()
+	}
+	// optional decimal part
+	if !l.atEnd() && l.peek() == '.' && l.pos+1 < len(l.src) && unicode.IsDigit(l.src[l.pos+1]) {
+		b.WriteRune('.')
+		l.advance()
+		for !l.atEnd() && unicode.IsDigit(l.peek()) {
+			b.WriteRune(l.peek())
+			l.advance()
+		}
+	}
+	return b.String()
+}
+
+func (l *Lexer) readString() (string, bool) {
+	// consume opening "
+	l.advance()
+
+	var b strings.Builder
+	for !l.atEnd() {
+		ch := l.peek()
+
+		// end
+		if ch == '"' {
+			l.advance()
+			return b.String(), true
+		}
+
+		// escape
+		if ch == '\\' {
+			l.advance()
+			if l.atEnd() {
+				return "", false
+			}
+			esc := l.peek()
+			switch esc {
+			case 'n':
+				b.WriteRune('\n')
+			case 'r':
+				b.WriteRune('\r')
+			case 't':
+				b.WriteRune('\t')
+			case '"':
+				b.WriteRune('"')
+			case '\\':
+				b.WriteRune('\\')
+			default:
+				// unknown escape: keep literal
+				b.WriteRune(esc)
+			}
+			l.advance()
+			continue
+		}
+
+		// raw char
+		b.WriteRune(ch)
+		l.advance()
 	}
 
-	l.advance()
-	return Token{Type: ILLEGAL, Lexeme: string(ch), Line: startLine, Col: startCol}
+	return "", false
 }
 
-func isAlpha(r rune) bool {
-	return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')
+func (l *Lexer) atEnd() bool { return l.pos >= len(l.src) }
+
+func (l *Lexer) peek() rune { return l.src[l.pos] }
+
+func (l *Lexer) peek2() rune {
+	if l.pos+1 >= len(l.src) {
+		return 0
+	}
+	return l.src[l.pos+1]
 }
 
-func isDigit(r rune) bool {
-	return r >= '0' && r <= '9'
-}
-
-func isAlphaNum(r rune) bool {
-	return isAlpha(r) || isDigit(r)
+func (l *Lexer) advance() {
+	l.pos++
+	l.col++
 }

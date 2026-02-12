@@ -5,10 +5,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
 	"bpl-plus/ast"
+	"bpl-plus/lexer"
+	"bpl-plus/parser"
 )
 
 type ValueKind int
@@ -19,6 +22,7 @@ const (
 	ValString
 	ValBool
 	ValArray
+	ValMap
 )
 
 // ArrayObject gives arrays reference semantics.
@@ -27,12 +31,19 @@ type ArrayObject struct {
 	Elems []Value
 }
 
+// MapObject gives maps reference semantics.
+// Copying a Value copies the pointer, so mutations affect all references.
+type MapObject struct {
+	Elems map[string]Value
+}
+
 type Value struct {
 	Kind   ValueKind
 	Number float64
 	Str    string
 	Bool   bool
 	Arr    *ArrayObject
+	Map    *MapObject
 }
 
 func NullValue() Value            { return Value{Kind: ValNull} }
@@ -42,12 +53,25 @@ func BoolValue(b bool) Value      { return Value{Kind: ValBool, Bool: b} }
 func ArrayValue(elems []Value) Value {
 	return Value{Kind: ValArray, Arr: &ArrayObject{Elems: elems}}
 }
+func MapValue(m map[string]Value) Value {
+	if m == nil {
+		m = map[string]Value{}
+	}
+	return Value{Kind: ValMap, Map: &MapObject{Elems: m}}
+}
 
 func (v Value) arrayElems() []Value {
 	if v.Kind != ValArray || v.Arr == nil {
 		return nil
 	}
 	return v.Arr.Elems
+}
+
+func (v Value) mapElems() map[string]Value {
+	if v.Kind != ValMap || v.Map == nil {
+		return nil
+	}
+	return v.Map.Elems
 }
 
 func (v Value) ToString() string {
@@ -57,13 +81,16 @@ func (v Value) ToString() string {
 			return fmt.Sprintf("%d", int64(v.Number))
 		}
 		return fmt.Sprintf("%g", v.Number)
+
 	case ValString:
 		return v.Str
+
 	case ValBool:
 		if v.Bool {
 			return "true"
 		}
 		return "false"
+
 	case ValArray:
 		elems := v.arrayElems()
 		var b strings.Builder
@@ -76,6 +103,29 @@ func (v Value) ToString() string {
 		}
 		b.WriteString("]")
 		return b.String()
+
+	case ValMap:
+		m := v.mapElems()
+		if m == nil {
+			return "{}"
+		}
+		keys := make([]string, 0, len(m))
+		for k := range m {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+
+		var b strings.Builder
+		b.WriteString("{")
+		for idx, k := range keys {
+			if idx > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString(fmt.Sprintf("%q: %s", k, m[k].ToString()))
+		}
+		b.WriteString("}")
+		return b.String()
+
 	default:
 		return "null"
 	}
@@ -127,6 +177,14 @@ func (e RuntimeError) Error() string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
+type moduleState int
+
+const (
+	modNone moduleState = iota
+	modLoading
+	modLoaded
+)
+
 type Interpreter struct {
 	globals map[string]Value
 	locals  []map[string]Value
@@ -138,21 +196,31 @@ type Interpreter struct {
 	lines    []string
 
 	callStack []string
+
+	// Modules: resolved absolute-ish path -> state (loading/loaded)
+	modules map[string]moduleState
+
+	// Stack of currently importing modules for circular import diagnostics
+	moduleStack []string
 }
 
 func NewWithSource(filename string, source string) *Interpreter {
 	return &Interpreter{
-		globals:   map[string]Value{},
-		locals:    []map[string]Value{},
-		funcs:     map[string]*ast.FunctionDecl{},
-		in:        bufio.NewReader(os.Stdin),
-		filename:  filename,
-		lines:     splitLinesPreserve(source),
-		callStack: []string{},
+		globals:     map[string]Value{},
+		locals:      []map[string]Value{},
+		funcs:       map[string]*ast.FunctionDecl{},
+		in:          bufio.NewReader(os.Stdin),
+		filename:    filename,
+		lines:       splitLinesPreserve(source),
+		callStack:   []string{},
+		modules:     map[string]moduleState{},
+		moduleStack: []string{},
 	}
 }
 
-func New() *Interpreter { return NewWithSource("", "") }
+func New() *Interpreter {
+	return NewWithSource("", "")
+}
 
 func splitLinesPreserve(src string) []string {
 	if src == "" {
@@ -223,6 +291,9 @@ func (i *Interpreter) findVarEnv(name string) (map[string]Value, Value, bool) {
 
 func (i *Interpreter) execStmt(s ast.Stmt) error {
 	switch stmt := s.(type) {
+	case *ast.ImportStmt:
+		return i.execImport(stmt)
+
 	case *ast.FunctionDecl:
 		i.funcs[stmt.Name] = stmt
 		return nil
@@ -303,27 +374,206 @@ func (i *Interpreter) execStmt(s ast.Stmt) error {
 	}
 }
 
+func (i *Interpreter) fileExists(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
+}
+
+func (i *Interpreter) projectRootCandidates() []string {
+	// Minimal, predictable “project root” approach:
+	// - current working directory
+	// We deliberately avoid “walk up parents” (can be surprising).
+	return []string{"."}
+}
+
+func (i *Interpreter) importCandidates(raw string, importerFilename string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return []string{}
+	}
+
+	// If the user omitted .bpl, we'll try both.
+	withExt := raw
+	needsExt := filepath.Ext(raw) == ""
+	if needsExt {
+		withExt = raw + ".bpl"
+	}
+
+	// If absolute path:
+	if filepath.IsAbs(raw) {
+		cands := []string{filepath.Clean(raw)}
+		if needsExt {
+			cands = append(cands, filepath.Clean(withExt))
+		}
+		return cands
+	}
+
+	// Relative path:
+	// 1) Resolve relative to the importing file’s directory (best UX)
+	// 2) Also allow a lib/ fallback relative to that directory
+	baseDir := ""
+	if importerFilename != "" {
+		baseDir = filepath.Dir(importerFilename)
+	}
+
+	cands := []string{}
+
+	// (a) relative to importer directory
+	if baseDir != "" {
+		cands = append(cands, filepath.Clean(filepath.Join(baseDir, raw)))
+		if needsExt {
+			cands = append(cands, filepath.Clean(filepath.Join(baseDir, withExt)))
+		}
+
+		// (b) lib/ relative to importer directory
+		cands = append(cands, filepath.Clean(filepath.Join(baseDir, "lib", raw)))
+		if needsExt {
+			cands = append(cands, filepath.Clean(filepath.Join(baseDir, "lib", withExt)))
+		}
+	}
+
+	// (c) relative to project root candidates (cwd)
+	for _, root := range i.projectRootCandidates() {
+		cands = append(cands, filepath.Clean(filepath.Join(root, raw)))
+		if needsExt {
+			cands = append(cands, filepath.Clean(filepath.Join(root, withExt)))
+		}
+
+		// (d) lib/ relative to project root candidates
+		cands = append(cands, filepath.Clean(filepath.Join(root, "lib", raw)))
+		if needsExt {
+			cands = append(cands, filepath.Clean(filepath.Join(root, "lib", withExt)))
+		}
+	}
+
+	// De-dup while preserving order
+	seen := map[string]bool{}
+	out := []string{}
+	for _, c := range cands {
+		if c == "" {
+			continue
+		}
+		if seen[c] {
+			continue
+		}
+		seen[c] = true
+		out = append(out, c)
+	}
+	return out
+}
+
+func (i *Interpreter) resolveImportPath(raw string, importerFilename string) (string, []string) {
+	cands := i.importCandidates(raw, importerFilename)
+	for _, c := range cands {
+		if i.fileExists(c) {
+			return c, cands
+		}
+	}
+	if len(cands) > 0 {
+		return cands[0], cands
+	}
+	return raw, cands
+}
+
+func (i *Interpreter) circularImportMessage(target string) string {
+	// Build something like:
+	// Circular import detected:
+	//   a.bpl
+	//   b.bpl
+	//   a.bpl
+	var b strings.Builder
+	b.WriteString("Circular import detected:\n")
+	for _, p := range i.moduleStack {
+		b.WriteString("  ")
+		b.WriteString(p)
+		b.WriteString("\n")
+	}
+	b.WriteString("  ")
+	b.WriteString(target)
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func (i *Interpreter) execImport(stmt *ast.ImportStmt) error {
+	// IMPORTANT: use the *current executing file* as the importer context
+	// so imports inside modules resolve relative to that module.
+	importerFile := i.filename
+
+	resolved, tried := i.resolveImportPath(stmt.Path, importerFile)
+
+	// Detect circular imports (loading -> import again)
+	switch i.modules[resolved] {
+	case modLoaded:
+		return nil
+	case modLoading:
+		return i.runtimeErr(stmt.GetSpan(), i.circularImportMessage(resolved))
+	}
+
+	// If file doesn't exist, provide useful info.
+	if !i.fileExists(resolved) {
+		msg := fmt.Sprintf("import failed: file not found %q", stmt.Path)
+		if len(tried) > 0 {
+			msg += "\nTried:\n"
+			for _, c := range tried {
+				msg += "  " + c + "\n"
+			}
+			msg = strings.TrimRight(msg, "\n")
+		}
+		return i.runtimeErr(stmt.GetSpan(), msg)
+	}
+
+	data, err := os.ReadFile(resolved)
+	if err != nil {
+		return i.runtimeErr(stmt.GetSpan(), fmt.Sprintf("import failed for %q: %v", resolved, err))
+	}
+
+	// Parse module
+	lx := lexer.New(string(data))
+	p := parser.New(lx)
+	prog, err := p.ParseProgram()
+	if err != nil {
+		return err
+	}
+
+	// Mark as loading and push stack for circular diagnostics
+	i.modules[resolved] = modLoading
+	i.moduleStack = append(i.moduleStack, resolved)
+
+	// Execute module with correct source context for runtime error lines
+	prevFile := i.filename
+	prevLines := i.lines
+
+	i.filename = resolved
+	i.lines = splitLinesPreserve(string(data))
+
+	runErr := i.Run(prog)
+
+	// Restore previous source context
+	i.filename = prevFile
+	i.lines = prevLines
+
+	// Pop module stack
+	i.moduleStack = i.moduleStack[:len(i.moduleStack)-1]
+
+	// If module failed, do NOT cache it as loaded
+	if runErr != nil {
+		i.modules[resolved] = modNone
+		return runErr
+	}
+
+	// Success: cache as loaded
+	i.modules[resolved] = modLoaded
+	return nil
+}
+
 func (i *Interpreter) execIndexAssign(stmt *ast.IndexAssignStmt) error {
-	env, arrVal, ok := i.findVarEnv(stmt.Name)
+	env, containerVal, ok := i.findVarEnv(stmt.Name)
 	if !ok {
 		return i.runtimeErr(stmt.GetSpan(), fmt.Sprintf("Undefined variable %q", stmt.Name))
-	}
-	if arrVal.Kind != ValArray || arrVal.Arr == nil {
-		return i.runtimeErr(stmt.GetSpan(), "Index assignment requires an array")
 	}
 
 	iv, err := i.evalExpr(stmt.Index)
 	if err != nil {
 		return err
-	}
-	idx, err := i.toIndex(iv, stmt.Index.GetSpan())
-	if err != nil {
-		return err
-	}
-
-	elems := arrVal.Arr.Elems
-	if idx < 0 || idx >= len(elems) {
-		return i.runtimeErr(stmt.GetSpan(), fmt.Sprintf("Array index out of bounds (index %d, size %d)", idx, len(elems)))
 	}
 
 	newVal, err := i.evalExpr(stmt.Value)
@@ -331,9 +581,37 @@ func (i *Interpreter) execIndexAssign(stmt *ast.IndexAssignStmt) error {
 		return err
 	}
 
-	arrVal.Arr.Elems[idx] = newVal
-	env[stmt.Name] = arrVal
-	return nil
+	// Array assignment
+	if containerVal.Kind == ValArray && containerVal.Arr != nil {
+		idx, err := i.toIndex(iv, stmt.Index.GetSpan())
+		if err != nil {
+			return err
+		}
+
+		elems := containerVal.Arr.Elems
+		if idx < 0 || idx >= len(elems) {
+			return i.runtimeErr(stmt.GetSpan(), fmt.Sprintf("Array index out of bounds (index %d, size %d)", idx, len(elems)))
+		}
+
+		containerVal.Arr.Elems[idx] = newVal
+		env[stmt.Name] = containerVal
+		return nil
+	}
+
+	// Map assignment
+	if containerVal.Kind == ValMap && containerVal.Map != nil {
+		if iv.Kind != ValString {
+			return i.runtimeErr(stmt.Index.GetSpan(), "Map key must be a string")
+		}
+		if containerVal.Map.Elems == nil {
+			containerVal.Map.Elems = map[string]Value{}
+		}
+		containerVal.Map.Elems[iv.Str] = newVal
+		env[stmt.Name] = containerVal
+		return nil
+	}
+
+	return i.runtimeErr(stmt.GetSpan(), "Index assignment requires an array or map")
 }
 
 func (i *Interpreter) execFor(stmt *ast.ForStmt) error {
@@ -410,6 +688,25 @@ func (i *Interpreter) valuesEqual(a, b Value) bool {
 			}
 		}
 		return true
+	case ValMap:
+		if a.Map == nil || b.Map == nil {
+			return a.Map == b.Map
+		}
+		am := a.Map.Elems
+		bm := b.Map.Elems
+		if len(am) != len(bm) {
+			return false
+		}
+		for k, av := range am {
+			bv, ok := bm[k]
+			if !ok {
+				return false
+			}
+			if !i.valuesEqual(av, bv) {
+				return false
+			}
+		}
+		return true
 	default:
 		return false
 	}
@@ -467,26 +764,52 @@ func (i *Interpreter) evalExpr(e ast.Expr) (Value, error) {
 		}
 		return ArrayValue(els), nil
 
+	case *ast.MapLiteralExpr:
+		m := map[string]Value{}
+		for _, ent := range expr.Entries {
+			v, err := i.evalExpr(ent.Value)
+			if err != nil {
+				return Value{}, err
+			}
+			m[ent.Key] = v
+		}
+		return MapValue(m), nil
+
 	case *ast.IndexExpr:
 		left, err := i.evalExpr(expr.Left)
 		if err != nil {
 			return Value{}, err
 		}
-		if left.Kind != ValArray || left.Arr == nil {
-			return Value{}, i.runtimeErr(expr.GetSpan(), "Indexing requires an array")
-		}
 		iv, err := i.evalExpr(expr.Index)
 		if err != nil {
 			return Value{}, err
 		}
-		idx, err := i.toIndex(iv, expr.Index.GetSpan())
-		if err != nil {
-			return Value{}, err
+
+		// Array indexing
+		if left.Kind == ValArray && left.Arr != nil {
+			idx, err := i.toIndex(iv, expr.Index.GetSpan())
+			if err != nil {
+				return Value{}, err
+			}
+			if idx < 0 || idx >= len(left.Arr.Elems) {
+				return Value{}, i.runtimeErr(expr.GetSpan(), fmt.Sprintf("Array index out of bounds (index %d, size %d)", idx, len(left.Arr.Elems)))
+			}
+			return left.Arr.Elems[idx], nil
 		}
-		if idx < 0 || idx >= len(left.Arr.Elems) {
-			return Value{}, i.runtimeErr(expr.GetSpan(), fmt.Sprintf("Array index out of bounds (index %d, size %d)", idx, len(left.Arr.Elems)))
+
+		// Map indexing
+		if left.Kind == ValMap && left.Map != nil {
+			if iv.Kind != ValString {
+				return Value{}, i.runtimeErr(expr.Index.GetSpan(), "Map key must be a string")
+			}
+			val, ok := left.Map.Elems[iv.Str]
+			if !ok {
+				return Value{}, i.runtimeErr(expr.GetSpan(), fmt.Sprintf("Map key %q not found", iv.Str))
+			}
+			return val, nil
 		}
-		return left.Arr.Elems[idx], nil
+
+		return Value{}, i.runtimeErr(expr.GetSpan(), "Indexing requires an array or map")
 
 	case *ast.Identifier:
 		if i.inFunction() {
@@ -518,7 +841,6 @@ func (i *Interpreter) evalExpr(e ast.Expr) (Value, error) {
 		}
 
 	case *ast.BinaryExpr:
-		// short-circuit booleans
 		if expr.Op == "and" || expr.Op == "or" {
 			left, err := i.evalExpr(expr.Left)
 			if err != nil {
@@ -724,10 +1046,85 @@ func (i *Interpreter) evalBuiltin(name string, argExprs []ast.Expr, callSpan ast
 				return NumberValue(0), nil
 			}
 			return NumberValue(float64(len(args[0].Arr.Elems))), nil
+		case ValMap:
+			if args[0].Map == nil || args[0].Map.Elems == nil {
+				return NumberValue(0), nil
+			}
+			return NumberValue(float64(len(args[0].Map.Elems))), nil
 		default:
-			return Value{}, i.runtimeErr(callSpan, "len() expects a string or array")
+			return Value{}, i.runtimeErr(callSpan, "len() expects a string, array, or map")
 		}
 
+	// Maps helpers
+	case "has":
+		if len(args) != 2 {
+			return Value{}, i.runtimeErr(callSpan, "has() expects 2 args: has(map, key)")
+		}
+		if args[0].Kind != ValMap || args[0].Map == nil {
+			return Value{}, i.runtimeErr(callSpan, "has() first argument must be a map")
+		}
+		if args[1].Kind != ValString {
+			return Value{}, i.runtimeErr(callSpan, "has() key must be a string")
+		}
+		_, ok := args[0].Map.Elems[args[1].Str]
+		return BoolValue(ok), nil
+
+	case "get":
+		if len(args) != 3 {
+			return Value{}, i.runtimeErr(callSpan, "get() expects 3 args: get(map, key, default)")
+		}
+		if args[0].Kind != ValMap || args[0].Map == nil {
+			return Value{}, i.runtimeErr(callSpan, "get() first argument must be a map")
+		}
+		if args[1].Kind != ValString {
+			return Value{}, i.runtimeErr(callSpan, "get() key must be a string")
+		}
+		if v, ok := args[0].Map.Elems[args[1].Str]; ok {
+			return v, nil
+		}
+		return args[2], nil
+
+	case "keys":
+		if len(args) != 1 {
+			return Value{}, i.runtimeErr(callSpan, "keys() expects 1 arg: keys(map)")
+		}
+		if args[0].Kind != ValMap || args[0].Map == nil {
+			return Value{}, i.runtimeErr(callSpan, "keys() expects a map")
+		}
+		m := args[0].Map.Elems
+		ks := make([]string, 0, len(m))
+		for k := range m {
+			ks = append(ks, k)
+		}
+		sort.Strings(ks)
+
+		out := make([]Value, 0, len(ks))
+		for _, k := range ks {
+			out = append(out, StringValue(k))
+		}
+		return ArrayValue(out), nil
+
+	case "values":
+		if len(args) != 1 {
+			return Value{}, i.runtimeErr(callSpan, "values() expects 1 arg: values(map)")
+		}
+		if args[0].Kind != ValMap || args[0].Map == nil {
+			return Value{}, i.runtimeErr(callSpan, "values() expects a map")
+		}
+		m := args[0].Map.Elems
+		ks := make([]string, 0, len(m))
+		for k := range m {
+			ks = append(ks, k)
+		}
+		sort.Strings(ks)
+
+		out := make([]Value, 0, len(ks))
+		for _, k := range ks {
+			out = append(out, m[k])
+		}
+		return ArrayValue(out), nil
+
+	// Arrays helpers
 	case "push":
 		if len(args) != 2 {
 			return Value{}, i.runtimeErr(callSpan, "push() expects 2 arguments: push(array, value)")
@@ -743,15 +1140,14 @@ func (i *Interpreter) evalBuiltin(name string, argExprs []ast.Expr, callSpan ast
 			return Value{}, i.runtimeErr(callSpan, "pop() expects 1 argument: pop(array)")
 		}
 		if args[0].Kind != ValArray || args[0].Arr == nil {
-			return Value{}, i.runtimeErr(callSpan, "pop() argument must be an array")
+			return Value{}, i.runtimeErr(callSpan, "pop() first argument must be an array")
 		}
-		elems := args[0].Arr.Elems
-		if len(elems) == 0 {
+		if len(args[0].Arr.Elems) == 0 {
 			return Value{}, i.runtimeErr(callSpan, "pop() cannot pop from an empty array")
 		}
-		removed := elems[len(elems)-1]
-		args[0].Arr.Elems = elems[:len(elems)-1]
-		return removed, nil
+		last := args[0].Arr.Elems[len(args[0].Arr.Elems)-1]
+		args[0].Arr.Elems = args[0].Arr.Elems[:len(args[0].Arr.Elems)-1]
+		return last, nil
 
 	case "insert":
 		if len(args) != 3 {
@@ -764,10 +1160,10 @@ func (i *Interpreter) evalBuiltin(name string, argExprs []ast.Expr, callSpan ast
 		if err != nil {
 			return Value{}, err
 		}
-		elems := args[0].Arr.Elems
-		if idx < 0 || idx > len(elems) {
-			return Value{}, i.runtimeErr(callSpan, fmt.Sprintf("insert() index out of bounds (index %d, size %d)", idx, len(elems)))
+		if idx < 0 || idx > len(args[0].Arr.Elems) {
+			return Value{}, i.runtimeErr(callSpan, fmt.Sprintf("insert() index out of bounds (index %d, size %d)", idx, len(args[0].Arr.Elems)))
 		}
+		elems := args[0].Arr.Elems
 		elems = append(elems, NullValue())
 		copy(elems[idx+1:], elems[idx:])
 		elems[idx] = args[2]
@@ -785,75 +1181,14 @@ func (i *Interpreter) evalBuiltin(name string, argExprs []ast.Expr, callSpan ast
 		if err != nil {
 			return Value{}, err
 		}
-		elems := args[0].Arr.Elems
-		if idx < 0 || idx >= len(elems) {
-			return Value{}, i.runtimeErr(callSpan, fmt.Sprintf("remove() index out of bounds (index %d, size %d)", idx, len(elems)))
+		if idx < 0 || idx >= len(args[0].Arr.Elems) {
+			return Value{}, i.runtimeErr(callSpan, fmt.Sprintf("remove() index out of bounds (index %d, size %d)", idx, len(args[0].Arr.Elems)))
 		}
-		removed := elems[idx]
-		copy(elems[idx:], elems[idx+1:])
-		elems = elems[:len(elems)-1]
-		args[0].Arr.Elems = elems
+		removed := args[0].Arr.Elems[idx]
+		args[0].Arr.Elems = append(args[0].Arr.Elems[:idx], args[0].Arr.Elems[idx+1:]...)
 		return removed, nil
 
-	// --- File I/O (v0.3.0) ---
-	case "readfile":
-		if len(args) != 1 {
-			return Value{}, i.runtimeErr(callSpan, "readfile() expects 1 argument: readfile(path)")
-		}
-		path := args[0].ToString()
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return Value{}, i.runtimeErr(callSpan, fmt.Sprintf("readfile() failed for %q: %v", path, err))
-		}
-		return StringValue(string(data)), nil
-
-	case "writefile":
-		if len(args) != 2 {
-			return Value{}, i.runtimeErr(callSpan, "writefile() expects 2 arguments: writefile(path, content)")
-		}
-		path := args[0].ToString()
-		content := args[1].ToString()
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil && filepath.Dir(path) != "." {
-			return Value{}, i.runtimeErr(callSpan, fmt.Sprintf("writefile() could not create directories for %q: %v", path, err))
-		}
-		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-			return Value{}, i.runtimeErr(callSpan, fmt.Sprintf("writefile() failed for %q: %v", path, err))
-		}
-		return NullValue(), nil
-
-	case "appendfile":
-		if len(args) != 2 {
-			return Value{}, i.runtimeErr(callSpan, "appendfile() expects 2 arguments: appendfile(path, content)")
-		}
-		path := args[0].ToString()
-		content := args[1].ToString()
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil && filepath.Dir(path) != "." {
-			return Value{}, i.runtimeErr(callSpan, fmt.Sprintf("appendfile() could not create directories for %q: %v", path, err))
-		}
-		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-		if err != nil {
-			return Value{}, i.runtimeErr(callSpan, fmt.Sprintf("appendfile() failed for %q: %v", path, err))
-		}
-		defer f.Close()
-		if _, err := f.WriteString(content); err != nil {
-			return Value{}, i.runtimeErr(callSpan, fmt.Sprintf("appendfile() write failed for %q: %v", path, err))
-		}
-		return NullValue(), nil
-
-	case "exists":
-		if len(args) != 1 {
-			return Value{}, i.runtimeErr(callSpan, "exists() expects 1 argument: exists(path)")
-		}
-		path := args[0].ToString()
-		_, err := os.Stat(path)
-		if err == nil {
-			return BoolValue(true), nil
-		}
-		if os.IsNotExist(err) {
-			return BoolValue(false), nil
-		}
-		return Value{}, i.runtimeErr(callSpan, fmt.Sprintf("exists() failed for %q: %v", path, err))
-
+	// Input
 	case "input":
 		if len(args) > 1 {
 			return Value{}, i.runtimeErr(callSpan, "input() expects 0 or 1 args")
@@ -863,6 +1198,65 @@ func (i *Interpreter) evalBuiltin(name string, argExprs []ast.Expr, callSpan ast
 		}
 		line, _ := i.in.ReadString('\n')
 		return StringValue(strings.TrimRight(line, "\r\n")), nil
+
+	// File I/O
+	case "writefile":
+		if len(args) != 2 {
+			return Value{}, i.runtimeErr(callSpan, "writefile() expects 2 args: writefile(path, contents)")
+		}
+		if args[0].Kind != ValString {
+			return Value{}, i.runtimeErr(callSpan, "writefile() path must be a string")
+		}
+		if err := os.WriteFile(args[0].Str, []byte(args[1].ToString()), 0644); err != nil {
+			return Value{}, i.runtimeErr(callSpan, fmt.Sprintf("writefile() failed: %v", err))
+		}
+		return NullValue(), nil
+
+	case "appendfile":
+		if len(args) != 2 {
+			return Value{}, i.runtimeErr(callSpan, "appendfile() expects 2 args: appendfile(path, contents)")
+		}
+		if args[0].Kind != ValString {
+			return Value{}, i.runtimeErr(callSpan, "appendfile() path must be a string")
+		}
+		f, err := os.OpenFile(args[0].Str, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			return Value{}, i.runtimeErr(callSpan, fmt.Sprintf("appendfile() failed: %v", err))
+		}
+		defer f.Close()
+		if _, err := f.WriteString(args[1].ToString()); err != nil {
+			return Value{}, i.runtimeErr(callSpan, fmt.Sprintf("appendfile() failed: %v", err))
+		}
+		return NullValue(), nil
+
+	case "readfile":
+		if len(args) != 1 {
+			return Value{}, i.runtimeErr(callSpan, "readfile() expects 1 arg: readfile(path)")
+		}
+		if args[0].Kind != ValString {
+			return Value{}, i.runtimeErr(callSpan, "readfile() path must be a string")
+		}
+		data, err := os.ReadFile(args[0].Str)
+		if err != nil {
+			return Value{}, i.runtimeErr(callSpan, fmt.Sprintf("readfile() failed: %v", err))
+		}
+		return StringValue(string(data)), nil
+
+	case "exists":
+		if len(args) != 1 {
+			return Value{}, i.runtimeErr(callSpan, "exists() expects 1 arg: exists(path)")
+		}
+		if args[0].Kind != ValString {
+			return Value{}, i.runtimeErr(callSpan, "exists() path must be a string")
+		}
+		_, err := os.Stat(args[0].Str)
+		if err == nil {
+			return BoolValue(true), nil
+		}
+		if os.IsNotExist(err) {
+			return BoolValue(false), nil
+		}
+		return Value{}, i.runtimeErr(callSpan, fmt.Sprintf("exists() failed: %v", err))
 	}
 
 	return Value{}, i.runtimeErr(callSpan, fmt.Sprintf("Undefined function %q", name))
