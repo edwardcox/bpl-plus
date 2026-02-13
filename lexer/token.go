@@ -26,6 +26,7 @@ const (
 	TRUE     TokenType = "TRUE"
 	FALSE    TokenType = "FALSE"
 
+	// Modules
 	IMPORT TokenType = "IMPORT"
 
 	AND TokenType = "AND"
@@ -43,15 +44,15 @@ const (
 	LBRACKET TokenType = "LBRACKET"
 	RBRACKET TokenType = "RBRACKET"
 
-	// Maps / objects
+	// Maps
 	LBRACE TokenType = "LBRACE"
 	RBRACE TokenType = "RBRACE"
 	COLON  TokenType = "COLON"
 
 	COMMA TokenType = "COMMA"
 
-	EQ  TokenType = "EQ"
-	NEQ TokenType = "NEQ"
+	EQ  TokenType = "EQ"  // ==
+	NEQ TokenType = "NEQ" // !=
 	LT  TokenType = "LT"
 	GT  TokenType = "GT"
 	LTE TokenType = "LTE"
@@ -72,6 +73,9 @@ func (t Token) String() string {
 	case IDENT, NUMBER:
 		return fmt.Sprintf("%s(%s) @ %d:%d", t.Type, t.Lexeme, t.Line, t.Col)
 	default:
+		if t.Lexeme != "" {
+			return fmt.Sprintf("%s(%s) @ %d:%d", t.Type, t.Lexeme, t.Line, t.Col)
+		}
 		return fmt.Sprintf("%s @ %d:%d", t.Type, t.Line, t.Col)
 	}
 }
@@ -103,6 +107,7 @@ func LookupIdent(ident string) TokenType {
 	case "false", "FALSE", "False":
 		return FALSE
 
+	// Modules
 	case "import", "IMPORT", "Import":
 		return IMPORT
 

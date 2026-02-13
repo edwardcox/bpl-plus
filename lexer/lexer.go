@@ -34,10 +34,8 @@ func (l *Lexer) NextToken() Token {
 
 	// NEWLINE
 	if ch == '\n' {
-		tok := Token{Type: NEWLINE, Line: l.line, Col: l.col}
-		l.advance() // consumes '\n'
-		l.line++
-		l.col = 1
+		tok := Token{Type: NEWLINE, Lexeme: "\n", Line: l.line, Col: l.col}
+		l.advance() // advance updates line/col
 		return tok
 	}
 
@@ -259,6 +257,17 @@ func (l *Lexer) peek2() rune {
 }
 
 func (l *Lexer) advance() {
+	if l.atEnd() {
+		return
+	}
+
+	ch := l.src[l.pos]
 	l.pos++
-	l.col++
+
+	if ch == '\n' {
+		l.line++
+		l.col = 1
+	} else {
+		l.col++
+	}
 }

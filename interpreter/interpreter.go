@@ -1124,6 +1124,64 @@ func (i *Interpreter) evalBuiltin(name string, argExprs []ast.Expr, callSpan ast
 		}
 		return ArrayValue(out), nil
 
+	// Maps Step C
+	case "items":
+		if len(args) != 1 {
+			return Value{}, i.runtimeErr(callSpan, "items() expects 1 arg: items(map)")
+		}
+		if args[0].Kind != ValMap || args[0].Map == nil {
+			return Value{}, i.runtimeErr(callSpan, "items() expects a map")
+		}
+		m := args[0].Map.Elems
+		if m == nil {
+			return ArrayValue([]Value{}), nil
+		}
+
+		ks := make([]string, 0, len(m))
+		for k := range m {
+			ks = append(ks, k)
+		}
+		sort.Strings(ks)
+
+		out := make([]Value, 0, len(ks))
+		for _, k := range ks {
+			pair := ArrayValue([]Value{StringValue(k), m[k]})
+			out = append(out, pair)
+		}
+		return ArrayValue(out), nil
+
+	case "del":
+		if len(args) != 2 {
+			return Value{}, i.runtimeErr(callSpan, "del() expects 2 args: del(map, key)")
+		}
+		if args[0].Kind != ValMap || args[0].Map == nil {
+			return Value{}, i.runtimeErr(callSpan, "del() first argument must be a map")
+		}
+		if args[1].Kind != ValString {
+			return Value{}, i.runtimeErr(callSpan, "del() key must be a string")
+		}
+		if args[0].Map.Elems != nil {
+			delete(args[0].Map.Elems, args[1].Str)
+		}
+		return NullValue(), nil
+
+	case "clear":
+		if len(args) != 1 {
+			return Value{}, i.runtimeErr(callSpan, "clear() expects 1 arg: clear(map)")
+		}
+		if args[0].Kind != ValMap || args[0].Map == nil {
+			return Value{}, i.runtimeErr(callSpan, "clear() expects a map")
+		}
+		// Keep reference semantics: mutate the existing map in place.
+		if args[0].Map.Elems == nil {
+			args[0].Map.Elems = map[string]Value{}
+		} else {
+			for k := range args[0].Map.Elems {
+				delete(args[0].Map.Elems, k)
+			}
+		}
+		return NullValue(), nil
+
 	// Arrays helpers
 	case "push":
 		if len(args) != 2 {
