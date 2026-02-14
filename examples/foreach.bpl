@@ -1,7 +1,11 @@
-a = [10, 20, 30]
+print "foreach demo"
 
-for each x in a
+a = [10, 20, 30]
+foreach x in a
   print x
 end
 
-print "done"
+m = {"b": 2, "a": 1, "c": 99}
+foreach k in m
+  print k
+end

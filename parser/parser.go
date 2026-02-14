@@ -2,6 +2,7 @@ package parser
 
 import (
 	"fmt"
+	"strconv"
 
 	"bpl-plus/ast"
 	"bpl-plus/lexer"
@@ -49,31 +50,45 @@ func (p *Parser) ParseProgram() ([]ast.Stmt, error) {
 func (p *Parser) parseStmt() (ast.Stmt, error) {
 	switch p.cur.Type {
 	case lexer.PRINT:
-		return p.parsePrint()
+		return p.parsePrintOrPrintHandle()
+
+	case lexer.OPEN:
+		return p.parseOpen()
+
+	case lexer.CLOSE:
+		return p.parseClose()
+
 	case lexer.IF:
 		return p.parseIf()
+
 	case lexer.WHILE:
 		return p.parseWhile()
+
 	case lexer.FOR:
-		// Support both:
-		//   for i = 1 to 10 ...
-		//   for each x in arr ...
-		if p.peek.Type == lexer.EACH {
-			return p.parseForEachFromFor()
-		}
 		return p.parseFor()
+
 	case lexer.FOREACH:
 		return p.parseForEach()
+
+	case lexer.BREAK:
+		b := p.cur
+		p.next()
+		return &ast.BreakStmt{S: sp(b)}, nil
+
+	case lexer.CONTINUE:
+		c := p.cur
+		p.next()
+		return &ast.ContinueStmt{S: sp(c)}, nil
+
 	case lexer.FUNCTION:
 		return p.parseFunctionDecl()
+
 	case lexer.RETURN:
 		return p.parseReturn()
+
 	case lexer.IMPORT:
 		return p.parseImport()
-	case lexer.BREAK:
-		return p.parseBreak()
-	case lexer.CONTINUE:
-		return p.parseContinue()
+
 	default:
 		// index assignment: a[i] = ...
 		if p.cur.Type == lexer.IDENT && p.peek.Type == lexer.LBRACKET {
@@ -91,9 +106,36 @@ func (p *Parser) parseStmt() (ast.Stmt, error) {
 	}
 }
 
-func (p *Parser) parsePrint() (ast.Stmt, error) {
+func (p *Parser) parsePrintOrPrintHandle() (ast.Stmt, error) {
 	printTok := p.cur
 	p.next()
+
+	// print #n, expr
+	if p.cur.Type == lexer.HASH {
+		hashTok := p.cur
+		p.next()
+		if p.cur.Type != lexer.NUMBER {
+			return nil, p.errAt(p.cur, "Expected handle number after '#'")
+		}
+		handle, err := strconv.Atoi(p.cur.Lexeme)
+		if err != nil {
+			return nil, p.errAt(p.cur, "Invalid handle number")
+		}
+		p.next()
+
+		if p.cur.Type != lexer.COMMA {
+			return nil, p.errAt(p.cur, "Expected ',' after print handle")
+		}
+		p.next()
+
+		expr, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		return &ast.PrintHandleStmt{S: sp(hashTok), Handle: handle, Value: expr}, nil
+	}
+
+	// normal print expr
 	expr, err := p.parseExpr()
 	if err != nil {
 		return nil, err
@@ -101,10 +143,74 @@ func (p *Parser) parsePrint() (ast.Stmt, error) {
 	return &ast.PrintStmt{S: sp(printTok), Value: expr}, nil
 }
 
+func (p *Parser) parseOpen() (ast.Stmt, error) {
+	openTok := p.cur
+	p.next()
+
+	// open #n, pathExpr, modeExpr
+	if p.cur.Type != lexer.HASH {
+		return nil, p.errAt(p.cur, "Expected '#' after 'open'")
+	}
+	p.next()
+
+	if p.cur.Type != lexer.NUMBER {
+		return nil, p.errAt(p.cur, "Expected handle number after '#'")
+	}
+	handle, err := strconv.Atoi(p.cur.Lexeme)
+	if err != nil {
+		return nil, p.errAt(p.cur, "Invalid handle number")
+	}
+	p.next()
+
+	if p.cur.Type != lexer.COMMA {
+		return nil, p.errAt(p.cur, "Expected ',' after handle")
+	}
+	p.next()
+
+	pathExpr, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+
+	if p.cur.Type != lexer.COMMA {
+		return nil, p.errAt(p.cur, "Expected ',' after path")
+	}
+	p.next()
+
+	modeExpr, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+
+	return &ast.OpenStmt{S: sp(openTok), Handle: handle, Path: pathExpr, Mode: modeExpr}, nil
+}
+
+func (p *Parser) parseClose() (ast.Stmt, error) {
+	closeTok := p.cur
+	p.next()
+
+	// close #n
+	if p.cur.Type != lexer.HASH {
+		return nil, p.errAt(p.cur, "Expected '#' after 'close'")
+	}
+	p.next()
+
+	if p.cur.Type != lexer.NUMBER {
+		return nil, p.errAt(p.cur, "Expected handle number after '#'")
+	}
+	handle, err := strconv.Atoi(p.cur.Lexeme)
+	if err != nil {
+		return nil, p.errAt(p.cur, "Invalid handle number")
+	}
+	p.next()
+
+	return &ast.CloseStmt{S: sp(closeTok), Handle: handle}, nil
+}
+
 func (p *Parser) parseAssign() (ast.Stmt, error) {
 	nameTok := p.cur
-	p.next() // move to '='
-	p.next() // move to expr
+	p.next() // '='
+	p.next() // expr
 	expr, err := p.parseExpr()
 	if err != nil {
 		return nil, err
@@ -117,7 +223,7 @@ func (p *Parser) parseIndexAssign() (ast.Stmt, error) {
 	nameTok := p.cur
 	name := nameTok.Lexeme
 
-	p.next() // to '['
+	p.next() // '['
 	if p.cur.Type != lexer.LBRACKET {
 		return nil, p.errAt(p.cur, "Expected '[' after identifier")
 	}
@@ -147,7 +253,6 @@ func (p *Parser) parseIndexAssign() (ast.Stmt, error) {
 	return &ast.IndexAssignStmt{S: sp(lbTok), Name: name, Index: indexExpr, Value: valExpr}, nil
 }
 
-// exprStmt = expr   (we only allow this in practice for calls right now)
 func (p *Parser) parseExprStmt() (ast.Stmt, error) {
 	startTok := p.cur
 	expr, err := p.parseExpr()
@@ -165,18 +270,6 @@ func (p *Parser) parseReturn() (ast.Stmt, error) {
 		return nil, err
 	}
 	return &ast.ReturnStmt{S: sp(retTok), Value: expr}, nil
-}
-
-func (p *Parser) parseBreak() (ast.Stmt, error) {
-	bTok := p.cur
-	p.next()
-	return &ast.BreakStmt{S: sp(bTok)}, nil
-}
-
-func (p *Parser) parseContinue() (ast.Stmt, error) {
-	cTok := p.cur
-	p.next()
-	return &ast.ContinueStmt{S: sp(cTok)}, nil
 }
 
 // importStmt = "import" STRING
@@ -373,36 +466,25 @@ func (p *Parser) parseFor() (ast.Stmt, error) {
 	return &ast.ForStmt{S: sp(varNameTok), Var: varName, Start: startExpr, End: endExpr, Step: stepExpr, Body: body}, nil
 }
 
-// for each x in expr
-// for each x, i in expr
-func (p *Parser) parseForEachFromFor() (ast.Stmt, error) {
-	// cur is FOR, peek is EACH
-	forTok := p.cur
-	p.next() // now at EACH
-	if p.cur.Type != lexer.EACH {
-		return nil, p.errAt(p.cur, "Expected 'each' after 'for' for foreach loop")
-	}
-	p.next() // now at first identifier
-	return p.parseForEachCore(sp(forTok))
-}
-
+// foreach x in expr
+// foreach x, i in expr
 func (p *Parser) parseForEach() (ast.Stmt, error) {
-	feTok := p.cur
-	p.next() // move to first identifier
-	return p.parseForEachCore(sp(feTok))
-}
+	startTok := p.cur
+	p.next()
 
-func (p *Parser) parseForEachCore(startSpan ast.Span) (ast.Stmt, error) {
+	// allow optional "each" keyword: foreach each x in ...
+	if p.cur.Type == lexer.EACH {
+		p.next()
+	}
+
 	if p.cur.Type != lexer.IDENT {
-		return nil, p.errAt(p.cur, "Expected loop variable after 'foreach'")
+		return nil, p.errAt(p.cur, "Expected variable name after 'foreach'")
 	}
 	valTok := p.cur
 	valName := valTok.Lexeme
-
-	idxName := ""
 	p.next()
 
-	// optional: ", indexVar"
+	idxName := ""
 	if p.cur.Type == lexer.COMMA {
 		p.next()
 		if p.cur.Type != lexer.IDENT {
@@ -412,9 +494,8 @@ func (p *Parser) parseForEachCore(startSpan ast.Span) (ast.Stmt, error) {
 		p.next()
 	}
 
-	// require "in"
 	if p.cur.Type != lexer.IN {
-		return nil, p.errAt(p.cur, "Expected 'in' in foreach loop")
+		return nil, p.errAt(p.cur, "Expected 'in' in foreach")
 	}
 	p.next()
 
@@ -439,13 +520,7 @@ func (p *Parser) parseForEachCore(startSpan ast.Span) (ast.Stmt, error) {
 	}
 	p.next()
 
-	return &ast.ForEachStmt{
-		S:        startSpan,
-		Var:      valName,
-		IndexVar: idxName,
-		Iterable: iterExpr,
-		Body:     body,
-	}, nil
+	return &ast.ForEachStmt{S: sp(startTok), Var: valName, IndexVar: idxName, Iterable: iterExpr, Body: body}, nil
 }
 
 func (p *Parser) parseBlockUntil(terminators ...lexer.TokenType) ([]ast.Stmt, error) {
@@ -697,7 +772,6 @@ func (p *Parser) parsePrimary() (ast.Expr, error) {
 	}
 }
 
-// arrayLiteral = "[" [ expr ("," expr)* ] "]"
 func (p *Parser) parseArrayLiteral() (ast.Expr, error) {
 	lbTok := p.cur
 	p.next()
@@ -731,14 +805,12 @@ func (p *Parser) parseArrayLiteral() (ast.Expr, error) {
 }
 
 // mapLiteral = "{" [ string ":" expr ("," string ":" expr)* ] "}"
-// Keys are STRING tokens (so you write: {"a": 1, "b": 2})
 func (p *Parser) parseMapLiteral() (ast.Expr, error) {
 	lbTok := p.cur // '{'
 	p.next()
 
 	entries := []ast.MapEntry{}
 
-	// empty map
 	if p.cur.Type == lexer.RBRACE {
 		p.next()
 		return &ast.MapLiteralExpr{S: sp(lbTok), Entries: entries}, nil

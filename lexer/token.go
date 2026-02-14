@@ -23,17 +23,23 @@ const (
 	STEP     TokenType = "STEP"
 	FUNCTION TokenType = "FUNCTION"
 	RETURN   TokenType = "RETURN"
-	TRUE     TokenType = "TRUE"
-	FALSE    TokenType = "FALSE"
 
-	// Loop control
-	BREAK    TokenType = "BREAK"
-	CONTINUE TokenType = "CONTINUE"
-
-	// ForEach sugar (support both "foreach" and "for each ... in ...")
+	// foreach sugar
 	FOREACH TokenType = "FOREACH"
 	EACH    TokenType = "EACH"
 	IN      TokenType = "IN"
+
+	// loop control
+	BREAK    TokenType = "BREAK"
+	CONTINUE TokenType = "CONTINUE"
+
+	// File handles
+	OPEN  TokenType = "OPEN"
+	CLOSE TokenType = "CLOSE"
+	HASH  TokenType = "HASH" // #
+
+	TRUE  TokenType = "TRUE"
+	FALSE TokenType = "FALSE"
 
 	// Modules
 	IMPORT TokenType = "IMPORT"
@@ -111,24 +117,31 @@ func LookupIdent(ident string) TokenType {
 		return FUNCTION
 	case "return", "RETURN", "Return":
 		return RETURN
-	case "true", "TRUE", "True":
-		return TRUE
-	case "false", "FALSE", "False":
-		return FALSE
 
-	// Loop control
-	case "break", "BREAK", "Break":
-		return BREAK
-	case "continue", "CONTINUE", "Continue":
-		return CONTINUE
-
-	// ForEach sugar (both styles)
-	case "foreach", "FOREACH", "Foreach", "forEach", "ForEach":
+	// foreach sugar
+	case "foreach", "FOREACH", "Foreach", "ForEach":
 		return FOREACH
 	case "each", "EACH", "Each":
 		return EACH
 	case "in", "IN", "In":
 		return IN
+
+	// loop control
+	case "break", "BREAK", "Break":
+		return BREAK
+	case "continue", "CONTINUE", "Continue":
+		return CONTINUE
+
+	// file handles
+	case "open", "OPEN", "Open":
+		return OPEN
+	case "close", "CLOSE", "Close":
+		return CLOSE
+
+	case "true", "TRUE", "True":
+		return TRUE
+	case "false", "FALSE", "False":
+		return FALSE
 
 	// Modules
 	case "import", "IMPORT", "Import":

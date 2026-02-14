@@ -112,6 +112,23 @@ func runREPL() error {
 				continue
 			}
 
+			// Convenience alias (people type this)
+			if trim == ":end" {
+				src := pasteBuf.String()
+				pasteBuf.Reset()
+				pasteMode = false
+
+				if strings.TrimSpace(src) == "" {
+					fmt.Println("(paste buffer empty)")
+					continue
+				}
+
+				chunk++
+				filename := replChunkFilename(chunk)
+				_ = compileAndRunWith(session, filename, src)
+				continue
+			}
+
 			// Accumulate raw lines
 			pasteBuf.WriteString(line)
 			pasteBuf.WriteString("\n")
@@ -122,10 +139,13 @@ func runREPL() error {
 
 		// Commands only when not buffering a block.
 		if depth == 0 && buf.Len() == 0 && strings.HasPrefix(trim, ":") {
-			handled, cmdErr := handleREPLCommand(trim, &buf, &depth, &pasteMode, &pasteBuf, session)
+			handled, cmdErr, shouldExit := handleREPLCommand(trim, &buf, &depth, &pasteMode, &pasteBuf, session)
 			if handled {
 				if cmdErr != nil {
 					fmt.Fprintln(os.Stderr, cmdErr.Error())
+				}
+				if shouldExit {
+					return nil
 				}
 				continue
 			}
@@ -192,11 +212,10 @@ func handleREPLCommand(
 	pasteMode *bool,
 	pasteBuf *strings.Builder,
 	session *interpreter.Interpreter,
-) (bool, error) {
+) (handled bool, err error, shouldExit bool) {
 	switch {
 	case cmd == ":q" || cmd == ":quit" || cmd == ":exit":
-		os.Exit(0)
-		return true, nil
+		return true, nil, true
 
 	case cmd == ":h" || cmd == ":help":
 		fmt.Println("Commands:")
@@ -215,46 +234,47 @@ func handleREPLCommand(
 		fmt.Println("Paste mode controls:")
 		fmt.Println("  .                   End + run pasted program")
 		fmt.Println("  :endpaste           End + run pasted program")
+		fmt.Println("  :end               Alias for end + run")
 		fmt.Println("  :cancel             Cancel paste without running")
 		fmt.Println()
 		fmt.Println("Notes:")
 		fmt.Println("  - Multi-line blocks: if/while/for/function ... end")
 		fmt.Println("  - Relative imports resolve from your current directory.")
 		fmt.Println("  - REPL input shares state across runs (vars/functions/modules persist).")
-		return true, nil
+		return true, nil, false
 
 	case cmd == ":pwd":
-		cwd, err := os.Getwd()
-		if err != nil {
-			return true, err
+		cwd, e := os.Getwd()
+		if e != nil {
+			return true, e, false
 		}
 		fmt.Println(cwd)
-		return true, nil
+		return true, nil, false
 
 	case strings.HasPrefix(cmd, ":cd "):
 		dir := strings.TrimSpace(strings.TrimPrefix(cmd, ":cd "))
 		if dir == "" {
-			return true, fmt.Errorf("Usage: :cd <dir>")
+			return true, fmt.Errorf("Usage: :cd <dir>"), false
 		}
-		if err := os.Chdir(dir); err != nil {
-			return true, err
+		if e := os.Chdir(dir); e != nil {
+			return true, e, false
 		}
-		return true, nil
+		return true, nil, false
 
 	case strings.HasPrefix(cmd, ":load "):
 		path := strings.TrimSpace(strings.TrimPrefix(cmd, ":load "))
 		if path == "" {
-			return true, fmt.Errorf("Usage: :load <file.bpl>")
+			return true, fmt.Errorf("Usage: :load <file.bpl>"), false
 		}
 
-		abs, err := filepath.Abs(path)
-		if err == nil {
+		abs, e := filepath.Abs(path)
+		if e == nil {
 			path = abs
 		}
 
-		b, err := os.ReadFile(path)
-		if err != nil {
-			return true, fmt.Errorf("Failed to read %s: %s", path, err.Error())
+		b, e := os.ReadFile(path)
+		if e != nil {
+			return true, fmt.Errorf("Failed to read %s: %s", path, e.Error()), false
 		}
 
 		// Make imports resolve relative to the loaded file directory.
@@ -263,17 +283,17 @@ func handleREPLCommand(
 		}
 
 		// Load runs like the CLI: fresh interpreter for the file
-		return true, runSource(path, string(b))
+		return true, runSource(path, string(b)), false
 
 	case cmd == ":reset":
 		buf.Reset()
 		*depth = 0
 		fmt.Println("(buffer cleared)")
-		return true, nil
+		return true, nil, false
 
 	case cmd == ":clear":
 		fmt.Print("\033[2J\033[H")
-		return true, nil
+		return true, nil, false
 
 	case cmd == ":paste":
 		buf.Reset()
@@ -281,13 +301,13 @@ func handleREPLCommand(
 		pasteBuf.Reset()
 		*pasteMode = true
 		fmt.Println("(paste mode: end with '.' or :endpaste, cancel with :cancel)")
-		return true, nil
+		return true, nil, false
 
 	case cmd == ":vars":
 		globs := session.GlobalsSnapshot()
 		if len(globs) == 0 {
 			fmt.Println("(no globals)")
-			return true, nil
+			return true, nil, false
 		}
 		keys := make([]string, 0, len(globs))
 		for k := range globs {
@@ -297,24 +317,24 @@ func handleREPLCommand(
 		for _, k := range keys {
 			fmt.Printf("%s = %v\n", k, globs[k])
 		}
-		return true, nil
+		return true, nil, false
 
 	case cmd == ":funcs":
 		names := session.FuncNames()
 		if len(names) == 0 {
 			fmt.Println("(no user functions)")
-			return true, nil
+			return true, nil, false
 		}
 		for _, n := range names {
 			fmt.Println(n)
 		}
-		return true, nil
+		return true, nil, false
 
 	case cmd == ":modules":
 		loading, loaded := session.ModulesSnapshot()
 		if len(loading) == 0 && len(loaded) == 0 {
 			fmt.Println("(no modules loaded)")
-			return true, nil
+			return true, nil, false
 		}
 		if len(loading) > 0 {
 			fmt.Println("loading:")
@@ -328,11 +348,11 @@ func handleREPLCommand(
 				fmt.Println("  " + p)
 			}
 		}
-		return true, nil
+		return true, nil, false
 
 	default:
 		fmt.Println("Unknown command. Try :help")
-		return true, nil
+		return true, nil, false
 	}
 }
 
@@ -366,8 +386,11 @@ func updateDepth(depth int, trimmed string) int {
 }
 
 func isBlockOpener(low string) bool {
+	// Explicitly list block headers (readability, and easier future tweaks).
+	// Note: "for " catches both classic for-loops and "for each ...".
 	return strings.HasPrefix(low, "if ") ||
 		strings.HasPrefix(low, "while ") ||
+		strings.HasPrefix(low, "for each ") ||
 		strings.HasPrefix(low, "for ") ||
 		strings.HasPrefix(low, "function ")
 }

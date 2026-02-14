@@ -1,31 +1,56 @@
 package main
 
 import (
+	"fmt"
+	"os"
+
 	"bpl-plus/interpreter"
 	"bpl-plus/lexer"
 	"bpl-plus/parser"
 )
 
-// compileAndRun is used for normal file execution (fresh interpreter each time).
-func compileAndRun(filename, src string, sourceLines []string) error {
-	_ = sourceLines // interpreter splits internally
+// compileAndRun is used by the CLI path (fresh interpreter per file).
+func compileAndRun(filename string, src string, sourceLines []string) error {
+	// Use your interpreter's source-aware constructor so runtime errors show caret lines.
 	in := interpreter.NewWithSource(filename, src)
-	return compileAndRunWith(in, filename, src)
-}
 
-// compileAndRunWith runs code using an existing interpreter instance.
-// This is what makes the REPL stateful across inputs.
-func compileAndRunWith(in *interpreter.Interpreter, filename, src string) error {
 	lx := lexer.New(src)
-
 	ps := parser.New(lx)
-	stmts, err := ps.ParseProgram()
+
+	prog, err := ps.ParseProgram()
 	if err != nil {
+		// Parser errors are plain errors (not runtimeErr formatted), so print here.
+		fmt.Fprintln(os.Stderr, err.Error())
 		return err
 	}
 
-	// Ensure runtime errors + imports have the right context for this chunk.
-	in.SetSource(filename, src)
+	if err := in.Run(prog); err != nil {
+		// RuntimeError.Error() already renders nicely with caret + stack.
+		fmt.Fprintln(os.Stderr, err.Error())
+		return err
+	}
 
-	return in.Run(stmts)
+	return nil
+}
+
+// compileAndRunWith is used by the REPL path (reuses one interpreter for session state).
+func compileAndRunWith(session *interpreter.Interpreter, filename string, src string) error {
+	// Update the interpreter's current source context so runtime errors show the right caret line.
+	session.SetSource(filename, src)
+
+	lx := lexer.New(src)
+	ps := parser.New(lx)
+
+	prog, err := ps.ParseProgram()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err.Error())
+		return err
+	}
+
+	if err := session.Run(prog); err != nil {
+		fmt.Fprintln(os.Stderr, err.Error())
+		return err
+	}
+
+	return nil
 }

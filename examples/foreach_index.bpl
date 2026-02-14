@@ -1,8 +1,11 @@
-a = [10, 20, 30]
+print "foreach demo with index/value"
 
-for each x, i in a
-  print i
-  print x
+a = ["x", "y", "z"]
+foreach x, i in a
+  print str(i) + ": " + x
 end
 
-print "done"
+m = {"b": 2, "a": 1, "c": 99}
+foreach k, v in m
+  print k + "=" + str(v)
+end

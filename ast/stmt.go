@@ -32,8 +32,8 @@ func (a *AssignStmt) String() string {
 	return fmt.Sprintf("AssignStmt(%s = %s)", a.Name, a.Value.String())
 }
 
-// --- Arrays v1 (index assignment) ---
-// a[i] = value
+// --- Arrays/Maps (index assignment) ---
+// a[i] = value   OR   m["k"] = value
 type IndexAssignStmt struct {
 	S     Span
 	Name  string
@@ -108,8 +108,8 @@ func (f *ForStmt) String() string {
 }
 
 // --- ForEach sugar ---
-// for each x in expr
-// for each x, i in expr
+// foreach x in expr
+// foreach x, i in expr
 type ForEachStmt struct {
 	S        Span
 	Var      string
@@ -126,6 +126,66 @@ func (f *ForEachStmt) String() string {
 		return fmt.Sprintf("ForEachStmt(%s,%s in %s, body=%d)", f.Var, f.IndexVar, f.Iterable.String(), len(f.Body))
 	}
 	return fmt.Sprintf("ForEachStmt(%s in %s, body=%d)", f.Var, f.Iterable.String(), len(f.Body))
+}
+
+// --- break / continue ---
+type BreakStmt struct {
+	S Span
+}
+
+func (b *BreakStmt) NodeKind() string { return "BreakStmt" }
+func (b *BreakStmt) stmtNode()        {}
+func (b *BreakStmt) GetSpan() Span    { return b.S }
+func (b *BreakStmt) String() string   { return "Break" }
+
+type ContinueStmt struct {
+	S Span
+}
+
+func (c *ContinueStmt) NodeKind() string { return "ContinueStmt" }
+func (c *ContinueStmt) stmtNode()        {}
+func (c *ContinueStmt) GetSpan() Span    { return c.S }
+func (c *ContinueStmt) String() string   { return "Continue" }
+
+// --- File handles ---
+// open #n, pathExpr, modeExpr
+type OpenStmt struct {
+	S      Span
+	Handle int
+	Path   Expr
+	Mode   Expr
+}
+
+func (o *OpenStmt) NodeKind() string { return "OpenStmt" }
+func (o *OpenStmt) stmtNode()        {}
+func (o *OpenStmt) GetSpan() Span    { return o.S }
+func (o *OpenStmt) String() string {
+	return fmt.Sprintf("Open(#%d, %s, %s)", o.Handle, o.Path.String(), o.Mode.String())
+}
+
+// close #n
+type CloseStmt struct {
+	S      Span
+	Handle int
+}
+
+func (c *CloseStmt) NodeKind() string { return "CloseStmt" }
+func (c *CloseStmt) stmtNode()        {}
+func (c *CloseStmt) GetSpan() Span    { return c.S }
+func (c *CloseStmt) String() string   { return fmt.Sprintf("Close(#%d)", c.Handle) }
+
+// print #n, expr
+type PrintHandleStmt struct {
+	S      Span
+	Handle int
+	Value  Expr
+}
+
+func (p *PrintHandleStmt) NodeKind() string { return "PrintHandleStmt" }
+func (p *PrintHandleStmt) stmtNode()        {}
+func (p *PrintHandleStmt) GetSpan() Span    { return p.S }
+func (p *PrintHandleStmt) String() string {
+	return fmt.Sprintf("PrintHandle(#%d, %s)", p.Handle, p.Value.String())
 }
 
 type FunctionDecl struct {
@@ -151,23 +211,3 @@ func (r *ReturnStmt) NodeKind() string { return "ReturnStmt" }
 func (r *ReturnStmt) stmtNode()        {}
 func (r *ReturnStmt) GetSpan() Span    { return r.S }
 func (r *ReturnStmt) String() string   { return fmt.Sprintf("Return(%s)", r.Value.String()) }
-
-// --- Loop control ---
-
-type BreakStmt struct {
-	S Span
-}
-
-func (b *BreakStmt) NodeKind() string { return "BreakStmt" }
-func (b *BreakStmt) stmtNode()        {}
-func (b *BreakStmt) GetSpan() Span    { return b.S }
-func (b *BreakStmt) String() string   { return "Break" }
-
-type ContinueStmt struct {
-	S Span
-}
-
-func (c *ContinueStmt) NodeKind() string { return "ContinueStmt" }
-func (c *ContinueStmt) stmtNode()        {}
-func (c *ContinueStmt) GetSpan() Span    { return c.S }
-func (c *ContinueStmt) String() string   { return "Continue" }

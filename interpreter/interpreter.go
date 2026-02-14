@@ -1,13 +1,17 @@
+// interpreter/interpreter.go
 package interpreter
 
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"bpl-plus/ast"
 	"bpl-plus/lexer"
@@ -26,13 +30,11 @@ const (
 )
 
 // ArrayObject gives arrays reference semantics.
-// Copying a Value copies the pointer, so mutations affect all references.
 type ArrayObject struct {
 	Elems []Value
 }
 
 // MapObject gives maps reference semantics.
-// Copying a Value copies the pointer, so mutations affect all references.
 type MapObject struct {
 	Elems map[string]Value
 }
@@ -131,9 +133,7 @@ func (v Value) ToString() string {
 	}
 }
 
-type ReturnSignal struct {
-	Val Value
-}
+type ReturnSignal struct{ Val Value }
 
 func (r ReturnSignal) Error() string { return "return" }
 
@@ -205,14 +205,13 @@ type Interpreter struct {
 
 	callStack []string
 
-	// Loop tracking (for validating break/continue usage)
-	loopDepth int
-
-	// Modules: resolved absolute-ish path -> state (loading/loaded)
-	modules map[string]moduleState
-
-	// Stack of currently importing modules for circular import diagnostics
+	modules     map[string]moduleState
 	moduleStack []string
+
+	// File handles: #n -> *os.File
+	files map[int]*os.File
+	// Buffered readers for handles (created on demand)
+	readers map[int]*bufio.Reader
 }
 
 func NewWithSource(filename string, source string) *Interpreter {
@@ -224,15 +223,14 @@ func NewWithSource(filename string, source string) *Interpreter {
 		filename:    filename,
 		lines:       splitLinesPreserve(source),
 		callStack:   []string{},
-		loopDepth:   0,
 		modules:     map[string]moduleState{},
 		moduleStack: []string{},
+		files:       map[int]*os.File{},
+		readers:     map[int]*bufio.Reader{},
 	}
 }
 
-func New() *Interpreter {
-	return NewWithSource("", "")
-}
+func New() *Interpreter { return NewWithSource("", "") }
 
 func splitLinesPreserve(src string) []string {
 	if src == "" {
@@ -258,17 +256,12 @@ func (i *Interpreter) popLocals()  { i.locals = i.locals[:len(i.locals)-1] }
 func (i *Interpreter) Run(stmts []ast.Stmt) error {
 	for _, s := range stmts {
 		if err := i.execStmt(s); err != nil {
-			// Propagate control-flow signals upward so loops can catch them.
-			if _, ok := err.(ReturnSignal); ok {
+			switch err.(type) {
+			case ReturnSignal, BreakSignal, ContinueSignal:
+				return err
+			default:
 				return err
 			}
-			if _, ok := err.(BreakSignal); ok {
-				return err
-			}
-			if _, ok := err.(ContinueSignal); ok {
-				return err
-			}
-			return err
 		}
 	}
 	return nil
@@ -328,15 +321,9 @@ func (i *Interpreter) execStmt(s ast.Stmt) error {
 		return ReturnSignal{Val: val}
 
 	case *ast.BreakStmt:
-		if i.loopDepth <= 0 {
-			return i.runtimeErr(stmt.GetSpan(), "break is only valid inside a loop")
-		}
 		return BreakSignal{}
 
 	case *ast.ContinueStmt:
-		if i.loopDepth <= 0 {
-			return i.runtimeErr(stmt.GetSpan(), "continue is only valid inside a loop")
-		}
 		return ContinueSignal{}
 
 	case *ast.AssignStmt:
@@ -362,6 +349,15 @@ func (i *Interpreter) execStmt(s ast.Stmt) error {
 		fmt.Println(val.ToString())
 		return nil
 
+	case *ast.OpenStmt:
+		return i.execOpen(stmt)
+
+	case *ast.CloseStmt:
+		return i.execClose(stmt)
+
+	case *ast.PrintHandleStmt:
+		return i.execPrintHandle(stmt)
+
 	case *ast.IfStmt:
 		cond, err := i.evalExpr(stmt.Condition)
 		if err != nil {
@@ -376,9 +372,6 @@ func (i *Interpreter) execStmt(s ast.Stmt) error {
 		return i.Run(stmt.Else)
 
 	case *ast.WhileStmt:
-		i.loopDepth++
-		defer func() { i.loopDepth-- }()
-
 		for {
 			cond, err := i.evalExpr(stmt.Condition)
 			if err != nil {
@@ -390,7 +383,6 @@ func (i *Interpreter) execStmt(s ast.Stmt) error {
 			if !cond.Bool {
 				break
 			}
-
 			err = i.Run(stmt.Body)
 			if err != nil {
 				switch err.(type) {
@@ -398,8 +390,6 @@ func (i *Interpreter) execStmt(s ast.Stmt) error {
 					return nil
 				case ContinueSignal:
 					continue
-				case ReturnSignal:
-					return err
 				default:
 					return err
 				}
@@ -421,6 +411,110 @@ func (i *Interpreter) execStmt(s ast.Stmt) error {
 		return i.runtimeErr(span, fmt.Sprintf("Unsupported statement %s", s.NodeKind()))
 	}
 }
+
+// ---------- File Handles ----------
+
+func (i *Interpreter) execOpen(stmt *ast.OpenStmt) error {
+	if stmt.Handle <= 0 {
+		return i.runtimeErr(stmt.GetSpan(), "open handle must be a positive integer")
+	}
+
+	pathV, err := i.evalExpr(stmt.Path)
+	if err != nil {
+		return err
+	}
+	modeV, err := i.evalExpr(stmt.Mode)
+	if err != nil {
+		return err
+	}
+	if pathV.Kind != ValString {
+		return i.runtimeErr(stmt.Path.GetSpan(), "open path must be a string")
+	}
+	if modeV.Kind != ValString {
+		return i.runtimeErr(stmt.Mode.GetSpan(), "open mode must be a string (\"r\", \"w\", or \"a\")")
+	}
+
+	mode := strings.ToLower(strings.TrimSpace(modeV.Str))
+	path := pathV.Str
+
+	// if already open, close first
+	if f, ok := i.files[stmt.Handle]; ok && f != nil {
+		_ = f.Close()
+	}
+	delete(i.files, stmt.Handle)
+	delete(i.readers, stmt.Handle)
+
+	var f *os.File
+
+	switch mode {
+	case "w":
+		// ✅ auto-create parent dirs
+		dir := filepath.Dir(path)
+		if dir != "" && dir != "." {
+			_ = os.MkdirAll(dir, 0755)
+		}
+		ff, e := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
+		if e != nil {
+			return i.runtimeErr(stmt.GetSpan(), fmt.Sprintf("open failed: %v", e))
+		}
+		f = ff
+
+	case "a":
+		// ✅ auto-create parent dirs
+		dir := filepath.Dir(path)
+		if dir != "" && dir != "." {
+			_ = os.MkdirAll(dir, 0755)
+		}
+		ff, e := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if e != nil {
+			return i.runtimeErr(stmt.GetSpan(), fmt.Sprintf("open failed: %v", e))
+		}
+		f = ff
+
+	case "r":
+		ff, e := os.Open(path)
+		if e != nil {
+			return i.runtimeErr(stmt.GetSpan(), fmt.Sprintf("open failed: %v", e))
+		}
+		f = ff
+
+	default:
+		return i.runtimeErr(stmt.GetSpan(), "open mode must be \"r\", \"w\", or \"a\"")
+	}
+
+	i.files[stmt.Handle] = f
+	// Reader will be created lazily (or immediately for read mode if you prefer).
+	return nil
+}
+
+func (i *Interpreter) execClose(stmt *ast.CloseStmt) error {
+	f, ok := i.files[stmt.Handle]
+	if !ok || f == nil {
+		return i.runtimeErr(stmt.GetSpan(), fmt.Sprintf("close failed: handle #%d is not open", stmt.Handle))
+	}
+	_ = f.Close()
+	delete(i.files, stmt.Handle)
+	delete(i.readers, stmt.Handle)
+	return nil
+}
+
+func (i *Interpreter) execPrintHandle(stmt *ast.PrintHandleStmt) error {
+	f, ok := i.files[stmt.Handle]
+	if !ok || f == nil {
+		return i.runtimeErr(stmt.GetSpan(), fmt.Sprintf("print failed: handle #%d is not open", stmt.Handle))
+	}
+	v, err := i.evalExpr(stmt.Value)
+	if err != nil {
+		return err
+	}
+	_, werr := f.WriteString(v.ToString() + "\n")
+	if werr != nil {
+		return i.runtimeErr(stmt.GetSpan(), fmt.Sprintf("print failed: %v", werr))
+	}
+	return nil
+}
+
+// ---------- Imports ----------
 
 func (i *Interpreter) fileExists(p string) bool {
 	_, err := os.Stat(p)
@@ -525,7 +619,6 @@ func (i *Interpreter) circularImportMessage(target string) string {
 
 func (i *Interpreter) execImport(stmt *ast.ImportStmt) error {
 	importerFile := i.filename
-
 	resolved, tried := i.resolveImportPath(stmt.Path, importerFile)
 
 	switch i.modules[resolved] {
@@ -583,6 +676,8 @@ func (i *Interpreter) execImport(stmt *ast.ImportStmt) error {
 	i.modules[resolved] = modLoaded
 	return nil
 }
+
+// ---------- Arrays / Maps / Loops ----------
 
 func (i *Interpreter) execIndexAssign(stmt *ast.IndexAssignStmt) error {
 	env, containerVal, ok := i.findVarEnv(stmt.Name)
@@ -658,9 +753,6 @@ func (i *Interpreter) execFor(stmt *ast.ForStmt) error {
 		step = -1
 	}
 
-	i.loopDepth++
-	defer func() { i.loopDepth-- }()
-
 	i.currentEnv()[stmt.Var] = NumberValue(startV.Number)
 
 	for {
@@ -682,8 +774,6 @@ func (i *Interpreter) execFor(stmt *ast.ForStmt) error {
 			case ContinueSignal:
 				i.currentEnv()[stmt.Var] = NumberValue(cur + step)
 				continue
-			case ReturnSignal:
-				return err
 			default:
 				return err
 			}
@@ -696,22 +786,17 @@ func (i *Interpreter) execFor(stmt *ast.ForStmt) error {
 }
 
 func (i *Interpreter) execForEach(stmt *ast.ForEachStmt) error {
-	iter, err := i.evalExpr(stmt.Iterable)
+	iterV, err := i.evalExpr(stmt.Iterable)
 	if err != nil {
 		return err
 	}
 
-	i.loopDepth++
-	defer func() { i.loopDepth-- }()
-
-	// foreach over array
-	if iter.Kind == ValArray && iter.Arr != nil {
-		for idx, v := range iter.Arr.Elems {
-			i.currentEnv()[stmt.Var] = v
+	if iterV.Kind == ValArray && iterV.Arr != nil {
+		for idx, el := range iterV.Arr.Elems {
+			i.currentEnv()[stmt.Var] = el
 			if stmt.IndexVar != "" {
 				i.currentEnv()[stmt.IndexVar] = NumberValue(float64(idx))
 			}
-
 			err := i.Run(stmt.Body)
 			if err != nil {
 				switch err.(type) {
@@ -719,8 +804,6 @@ func (i *Interpreter) execForEach(stmt *ast.ForEachStmt) error {
 					return nil
 				case ContinueSignal:
 					continue
-				case ReturnSignal:
-					return err
 				default:
 					return err
 				}
@@ -729,9 +812,8 @@ func (i *Interpreter) execForEach(stmt *ast.ForEachStmt) error {
 		return nil
 	}
 
-	// foreach over map (stable key order)
-	if iter.Kind == ValMap && iter.Map != nil {
-		m := iter.Map.Elems
+	if iterV.Kind == ValMap && iterV.Map != nil {
+		m := iterV.Map.Elems
 		keys := make([]string, 0, len(m))
 		for k := range m {
 			keys = append(keys, k)
@@ -739,15 +821,10 @@ func (i *Interpreter) execForEach(stmt *ast.ForEachStmt) error {
 		sort.Strings(keys)
 
 		for idx, k := range keys {
-			// VALUE var gets key (matches your demo output: a b c)
 			i.currentEnv()[stmt.Var] = StringValue(k)
 			if stmt.IndexVar != "" {
-				// INDEX var gets value (matches your demo output: a=1 etc when you print key=value)
-				i.currentEnv()[stmt.IndexVar] = m[k]
+				i.currentEnv()[stmt.IndexVar] = NumberValue(float64(idx))
 			}
-
-			_ = idx // idx intentionally unused here (kept in case you want numeric index later)
-
 			err := i.Run(stmt.Body)
 			if err != nil {
 				switch err.(type) {
@@ -755,8 +832,6 @@ func (i *Interpreter) execForEach(stmt *ast.ForEachStmt) error {
 					return nil
 				case ContinueSignal:
 					continue
-				case ReturnSignal:
-					return err
 				default:
 					return err
 				}
@@ -843,6 +918,78 @@ func (i *Interpreter) toIndex(v Value, span ast.Span) (int, error) {
 	}
 	return idx, nil
 }
+
+// ---------- String helpers (runes) ----------
+
+func runeLen(s string) int { return utf8.RuneCountInString(s) }
+
+func substrRunes(s string, start int, length *int) (string, bool) {
+	rs := []rune(s)
+	if start < 0 || start > len(rs) {
+		return "", false
+	}
+	if length == nil {
+		return string(rs[start:]), true
+	}
+	if *length < 0 {
+		return "", false
+	}
+	end := start + *length
+	if end > len(rs) {
+		end = len(rs)
+	}
+	return string(rs[start:end]), true
+}
+
+func runeIndexOf(hay, needle string) int {
+	hs := []rune(hay)
+	ns := []rune(needle)
+	if len(ns) == 0 {
+		return 0
+	}
+	if len(ns) > len(hs) {
+		return -1
+	}
+	for i := 0; i <= len(hs)-len(ns); i++ {
+		ok := true
+		for j := 0; j < len(ns); j++ {
+			if hs[i+j] != ns[j] {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return i
+		}
+	}
+	return -1
+}
+
+func runeLastIndexOf(hay, needle string) int {
+	hs := []rune(hay)
+	ns := []rune(needle)
+	if len(ns) == 0 {
+		return len(hs)
+	}
+	if len(ns) > len(hs) {
+		return -1
+	}
+	for i := len(hs) - len(ns); i >= 0; i-- {
+		ok := true
+		for j := 0; j < len(ns); j++ {
+			if hs[i+j] != ns[j] {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return i
+		}
+	}
+	return -1
+}
+
+// ---------- Expressions ----------
 
 func (i *Interpreter) evalExpr(e ast.Expr) (Value, error) {
 	switch expr := e.(type) {
@@ -994,7 +1141,6 @@ func (i *Interpreter) evalExpr(e ast.Expr) (Value, error) {
 			if left.Kind == ValNumber && right.Kind == ValNumber {
 				return NumberValue(left.Number + right.Number), nil
 			}
-
 			if left.Kind == ValArray && right.Kind == ValArray {
 				if left.Arr == nil || right.Arr == nil {
 					return Value{}, i.runtimeErr(expr.GetSpan(), "Array concat requires valid arrays")
@@ -1004,7 +1150,6 @@ func (i *Interpreter) evalExpr(e ast.Expr) (Value, error) {
 				out = append(out, right.Arr.Elems...)
 				return ArrayValue(out), nil
 			}
-
 			return StringValue(left.ToString() + right.ToString()), nil
 		}
 
@@ -1105,6 +1250,21 @@ func (i *Interpreter) evalUserCall(fn *ast.FunctionDecl, args []ast.Expr, callSp
 	return Value{}, i.runtimeErr(fn.GetSpan(), fmt.Sprintf("Function %q ended without return", fn.Name))
 }
 
+// ---------- Builtins ----------
+
+func (i *Interpreter) getHandleReader(handle int) (*bufio.Reader, *os.File, error) {
+	f, ok := i.files[handle]
+	if !ok || f == nil {
+		return nil, nil, fmt.Errorf("handle #%d is not open", handle)
+	}
+	if r, ok := i.readers[handle]; ok && r != nil {
+		return r, f, nil
+	}
+	r := bufio.NewReader(f)
+	i.readers[handle] = r
+	return r, f, nil
+}
+
 func (i *Interpreter) evalBuiltin(name string, argExprs []ast.Expr, callSpan ast.Span) (Value, error) {
 	args := []Value{}
 	for _, a := range argExprs {
@@ -1116,6 +1276,7 @@ func (i *Interpreter) evalBuiltin(name string, argExprs []ast.Expr, callSpan ast
 	}
 
 	switch name {
+	// --- core ---
 	case "str":
 		if len(args) != 1 {
 			return Value{}, i.runtimeErr(callSpan, "str() expects 1 arg")
@@ -1141,7 +1302,7 @@ func (i *Interpreter) evalBuiltin(name string, argExprs []ast.Expr, callSpan ast
 		}
 		switch args[0].Kind {
 		case ValString:
-			return NumberValue(float64(len([]rune(args[0].Str)))), nil
+			return NumberValue(float64(runeLen(args[0].Str))), nil
 		case ValArray:
 			if args[0].Arr == nil {
 				return NumberValue(0), nil
@@ -1156,197 +1317,239 @@ func (i *Interpreter) evalBuiltin(name string, argExprs []ast.Expr, callSpan ast
 			return Value{}, i.runtimeErr(callSpan, "len() expects a string, array, or map")
 		}
 
-	// Maps helpers
-	case "has":
-		if len(args) != 2 {
-			return Value{}, i.runtimeErr(callSpan, "has() expects 2 args: has(map, key)")
+	// --- string funcs ---
+	case "lower":
+		if len(args) != 1 || args[0].Kind != ValString {
+			return Value{}, i.runtimeErr(callSpan, "lower() expects 1 string arg")
 		}
-		if args[0].Kind != ValMap || args[0].Map == nil {
-			return Value{}, i.runtimeErr(callSpan, "has() first argument must be a map")
+		return StringValue(strings.ToLower(args[0].Str)), nil
+
+	case "upper":
+		if len(args) != 1 || args[0].Kind != ValString {
+			return Value{}, i.runtimeErr(callSpan, "upper() expects 1 string arg")
+		}
+		return StringValue(strings.ToUpper(args[0].Str)), nil
+
+	case "trim":
+		if len(args) != 1 && len(args) != 2 {
+			return Value{}, i.runtimeErr(callSpan, "trim() expects 1 or 2 args: trim(s [,cutset])")
+		}
+		if args[0].Kind != ValString {
+			return Value{}, i.runtimeErr(callSpan, "trim() first arg must be a string")
+		}
+		if len(args) == 1 {
+			return StringValue(strings.TrimSpace(args[0].Str)), nil
 		}
 		if args[1].Kind != ValString {
-			return Value{}, i.runtimeErr(callSpan, "has() key must be a string")
+			return Value{}, i.runtimeErr(callSpan, "trim() cutset must be a string")
 		}
-		_, ok := args[0].Map.Elems[args[1].Str]
-		return BoolValue(ok), nil
+		return StringValue(strings.Trim(args[0].Str, args[1].Str)), nil
 
-	case "get":
-		if len(args) != 3 {
-			return Value{}, i.runtimeErr(callSpan, "get() expects 3 args: get(map, key, default)")
+	case "ltrim":
+		if len(args) != 1 && len(args) != 2 {
+			return Value{}, i.runtimeErr(callSpan, "ltrim() expects 1 or 2 args: ltrim(s [,cutset])")
 		}
-		if args[0].Kind != ValMap || args[0].Map == nil {
-			return Value{}, i.runtimeErr(callSpan, "get() first argument must be a map")
+		if args[0].Kind != ValString {
+			return Value{}, i.runtimeErr(callSpan, "ltrim() first arg must be a string")
+		}
+		if len(args) == 1 {
+			return StringValue(strings.TrimLeftFunc(args[0].Str, unicode.IsSpace)), nil
 		}
 		if args[1].Kind != ValString {
-			return Value{}, i.runtimeErr(callSpan, "get() key must be a string")
+			return Value{}, i.runtimeErr(callSpan, "ltrim() cutset must be a string")
 		}
-		if v, ok := args[0].Map.Elems[args[1].Str]; ok {
-			return v, nil
-		}
-		return args[2], nil
+		return StringValue(strings.TrimLeft(args[0].Str, args[1].Str)), nil
 
-	case "keys":
-		if len(args) != 1 {
-			return Value{}, i.runtimeErr(callSpan, "keys() expects 1 arg: keys(map)")
+	case "rtrim":
+		if len(args) != 1 && len(args) != 2 {
+			return Value{}, i.runtimeErr(callSpan, "rtrim() expects 1 or 2 args: rtrim(s [,cutset])")
 		}
-		if args[0].Kind != ValMap || args[0].Map == nil {
-			return Value{}, i.runtimeErr(callSpan, "keys() expects a map")
+		if args[0].Kind != ValString {
+			return Value{}, i.runtimeErr(callSpan, "rtrim() first arg must be a string")
 		}
-		m := args[0].Map.Elems
-		ks := make([]string, 0, len(m))
-		for k := range m {
-			ks = append(ks, k)
-		}
-		sort.Strings(ks)
-
-		out := make([]Value, 0, len(ks))
-		for _, k := range ks {
-			out = append(out, StringValue(k))
-		}
-		return ArrayValue(out), nil
-
-	case "values":
-		if len(args) != 1 {
-			return Value{}, i.runtimeErr(callSpan, "values() expects 1 arg: values(map)")
-		}
-		if args[0].Kind != ValMap || args[0].Map == nil {
-			return Value{}, i.runtimeErr(callSpan, "values() expects a map")
-		}
-		m := args[0].Map.Elems
-		ks := make([]string, 0, len(m))
-		for k := range m {
-			ks = append(ks, k)
-		}
-		sort.Strings(ks)
-
-		out := make([]Value, 0, len(ks))
-		for _, k := range ks {
-			out = append(out, m[k])
-		}
-		return ArrayValue(out), nil
-
-	// Maps Step C
-	case "items":
-		if len(args) != 1 {
-			return Value{}, i.runtimeErr(callSpan, "items() expects 1 arg: items(map)")
-		}
-		if args[0].Kind != ValMap || args[0].Map == nil {
-			return Value{}, i.runtimeErr(callSpan, "items() expects a map")
-		}
-		m := args[0].Map.Elems
-		if m == nil {
-			return ArrayValue([]Value{}), nil
-		}
-
-		ks := make([]string, 0, len(m))
-		for k := range m {
-			ks = append(ks, k)
-		}
-		sort.Strings(ks)
-
-		out := make([]Value, 0, len(ks))
-		for _, k := range ks {
-			pair := ArrayValue([]Value{StringValue(k), m[k]})
-			out = append(out, pair)
-		}
-		return ArrayValue(out), nil
-
-	case "del":
-		if len(args) != 2 {
-			return Value{}, i.runtimeErr(callSpan, "del() expects 2 args: del(map, key)")
-		}
-		if args[0].Kind != ValMap || args[0].Map == nil {
-			return Value{}, i.runtimeErr(callSpan, "del() first argument must be a map")
+		if len(args) == 1 {
+			return StringValue(strings.TrimRightFunc(args[0].Str, unicode.IsSpace)), nil
 		}
 		if args[1].Kind != ValString {
-			return Value{}, i.runtimeErr(callSpan, "del() key must be a string")
+			return Value{}, i.runtimeErr(callSpan, "rtrim() cutset must be a string")
 		}
-		if args[0].Map.Elems != nil {
-			delete(args[0].Map.Elems, args[1].Str)
-		}
-		return NullValue(), nil
+		return StringValue(strings.TrimRight(args[0].Str, args[1].Str)), nil
 
-	case "clear":
-		if len(args) != 1 {
-			return Value{}, i.runtimeErr(callSpan, "clear() expects 1 arg: clear(map)")
+	case "contains":
+		if len(args) != 2 || args[0].Kind != ValString || args[1].Kind != ValString {
+			return Value{}, i.runtimeErr(callSpan, "contains() expects 2 string args: contains(s, sub)")
 		}
-		if args[0].Kind != ValMap || args[0].Map == nil {
-			return Value{}, i.runtimeErr(callSpan, "clear() expects a map")
+		return BoolValue(strings.Contains(args[0].Str, args[1].Str)), nil
+
+	case "startswith":
+		if len(args) != 2 || args[0].Kind != ValString || args[1].Kind != ValString {
+			return Value{}, i.runtimeErr(callSpan, "startswith() expects 2 string args: startswith(s, prefix)")
 		}
-		if args[0].Map.Elems == nil {
-			args[0].Map.Elems = map[string]Value{}
-		} else {
-			for k := range args[0].Map.Elems {
-				delete(args[0].Map.Elems, k)
+		return BoolValue(strings.HasPrefix(args[0].Str, args[1].Str)), nil
+
+	case "endswith":
+		if len(args) != 2 || args[0].Kind != ValString || args[1].Kind != ValString {
+			return Value{}, i.runtimeErr(callSpan, "endswith() expects 2 string args: endswith(s, suffix)")
+		}
+		return BoolValue(strings.HasSuffix(args[0].Str, args[1].Str)), nil
+
+	case "replace":
+		if len(args) != 3 && len(args) != 4 {
+			return Value{}, i.runtimeErr(callSpan, "replace() expects 3 or 4 args: replace(s, old, new [,n])")
+		}
+		if args[0].Kind != ValString || args[1].Kind != ValString || args[2].Kind != ValString {
+			return Value{}, i.runtimeErr(callSpan, "replace() expects string args for s/old/new")
+		}
+		n := -1
+		if len(args) == 4 {
+			if args[3].Kind != ValNumber {
+				return Value{}, i.runtimeErr(callSpan, "replace() n must be a number")
 			}
+			n = int(args[3].Number)
 		}
-		return NullValue(), nil
+		return StringValue(strings.Replace(args[0].Str, args[1].Str, args[2].Str, n)), nil
 
-	// Arrays helpers
-	case "push":
+	case "split":
+		if len(args) != 2 || args[0].Kind != ValString || args[1].Kind != ValString {
+			return Value{}, i.runtimeErr(callSpan, "split() expects 2 string args: split(s, sep)")
+		}
+		parts := strings.Split(args[0].Str, args[1].Str)
+		out := make([]Value, 0, len(parts))
+		for _, p := range parts {
+			out = append(out, StringValue(p))
+		}
+		return ArrayValue(out), nil
+
+	case "join":
 		if len(args) != 2 {
-			return Value{}, i.runtimeErr(callSpan, "push() expects 2 arguments: push(array, value)")
+			return Value{}, i.runtimeErr(callSpan, "join() expects 2 args: join(array, sep)")
 		}
 		if args[0].Kind != ValArray || args[0].Arr == nil {
-			return Value{}, i.runtimeErr(callSpan, "push() first argument must be an array")
+			return Value{}, i.runtimeErr(callSpan, "join() first arg must be an array")
 		}
-		args[0].Arr.Elems = append(args[0].Arr.Elems, args[1])
-		return NullValue(), nil
-
-	case "pop":
-		if len(args) != 1 {
-			return Value{}, i.runtimeErr(callSpan, "pop() expects 1 argument: pop(array)")
+		if args[1].Kind != ValString {
+			return Value{}, i.runtimeErr(callSpan, "join() sep must be a string")
 		}
-		if args[0].Kind != ValArray || args[0].Arr == nil {
-			return Value{}, i.runtimeErr(callSpan, "pop() first argument must be an array")
-		}
-		if len(args[0].Arr.Elems) == 0 {
-			return Value{}, i.runtimeErr(callSpan, "pop() cannot pop from an empty array")
-		}
-		last := args[0].Arr.Elems[len(args[0].Arr.Elems)-1]
-		args[0].Arr.Elems = args[0].Arr.Elems[:len(args[0].Arr.Elems)-1]
-		return last, nil
-
-	case "insert":
-		if len(args) != 3 {
-			return Value{}, i.runtimeErr(callSpan, "insert() expects 3 arguments: insert(array, index, value)")
-		}
-		if args[0].Kind != ValArray || args[0].Arr == nil {
-			return Value{}, i.runtimeErr(callSpan, "insert() first argument must be an array")
-		}
-		idx, err := i.toIndex(args[1], callSpan)
-		if err != nil {
-			return Value{}, err
-		}
-		if idx < 0 || idx > len(args[0].Arr.Elems) {
-			return Value{}, i.runtimeErr(callSpan, fmt.Sprintf("insert() index out of bounds (index %d, size %d)", idx, len(args[0].Arr.Elems)))
-		}
+		sep := args[1].Str
 		elems := args[0].Arr.Elems
-		elems = append(elems, NullValue())
-		copy(elems[idx+1:], elems[idx:])
-		elems[idx] = args[2]
-		args[0].Arr.Elems = elems
-		return NullValue(), nil
+		ss := make([]string, 0, len(elems))
+		for _, v := range elems {
+			ss = append(ss, v.ToString())
+		}
+		return StringValue(strings.Join(ss, sep)), nil
 
-	case "remove":
-		if len(args) != 2 {
-			return Value{}, i.runtimeErr(callSpan, "remove() expects 2 arguments: remove(array, index)")
+	case "indexof":
+		if len(args) != 2 || args[0].Kind != ValString || args[1].Kind != ValString {
+			return Value{}, i.runtimeErr(callSpan, "indexof() expects 2 string args: indexof(s, sub)")
 		}
-		if args[0].Kind != ValArray || args[0].Arr == nil {
-			return Value{}, i.runtimeErr(callSpan, "remove() first argument must be an array")
+		return NumberValue(float64(runeIndexOf(args[0].Str, args[1].Str))), nil
+
+	case "lastindexof":
+		if len(args) != 2 || args[0].Kind != ValString || args[1].Kind != ValString {
+			return Value{}, i.runtimeErr(callSpan, "lastindexof() expects 2 string args: lastindexof(s, sub)")
 		}
-		idx, err := i.toIndex(args[1], callSpan)
+		return NumberValue(float64(runeLastIndexOf(args[0].Str, args[1].Str))), nil
+
+	case "repeat":
+		if len(args) != 2 || args[0].Kind != ValString || args[1].Kind != ValNumber {
+			return Value{}, i.runtimeErr(callSpan, "repeat() expects (string, number): repeat(s, n)")
+		}
+		n := int(args[1].Number)
+		if n < 0 {
+			return Value{}, i.runtimeErr(callSpan, "repeat() n must be >= 0")
+		}
+		return StringValue(strings.Repeat(args[0].Str, n)), nil
+
+	case "substr":
+		if len(args) != 2 && len(args) != 3 {
+			return Value{}, i.runtimeErr(callSpan, "substr() expects 2 or 3 args: substr(s, start [,len])")
+		}
+		if args[0].Kind != ValString || args[1].Kind != ValNumber {
+			return Value{}, i.runtimeErr(callSpan, "substr() expects (string, number [,number])")
+		}
+		start := int(args[1].Number)
+		if args[1].Number != float64(start) {
+			return Value{}, i.runtimeErr(callSpan, "substr() start must be an integer")
+		}
+		if len(args) == 2 {
+			out, ok := substrRunes(args[0].Str, start, nil)
+			if !ok {
+				return Value{}, i.runtimeErr(callSpan, "substr() out of range")
+			}
+			return StringValue(out), nil
+		}
+		if args[2].Kind != ValNumber {
+			return Value{}, i.runtimeErr(callSpan, "substr() len must be a number")
+		}
+		l := int(args[2].Number)
+		if args[2].Number != float64(l) {
+			return Value{}, i.runtimeErr(callSpan, "substr() len must be an integer")
+		}
+		out, ok := substrRunes(args[0].Str, start, &l)
+		if !ok {
+			return Value{}, i.runtimeErr(callSpan, "substr() out of range")
+		}
+		return StringValue(out), nil
+
+	// --- file handle read helpers ---
+	case "lineinput":
+		// lineinput(handle) -> string | null
+		if len(args) != 1 || args[0].Kind != ValNumber {
+			return Value{}, i.runtimeErr(callSpan, "lineinput() expects 1 number arg: lineinput(handle)")
+		}
+		h := int(args[0].Number)
+		if args[0].Number != float64(h) || h <= 0 {
+			return Value{}, i.runtimeErr(callSpan, "lineinput() handle must be a positive integer")
+		}
+
+		r, _, herr := i.getHandleReader(h)
+		if herr != nil {
+			return Value{}, i.runtimeErr(callSpan, "lineinput() failed: "+herr.Error())
+		}
+
+		line, err := r.ReadString('\n')
 		if err != nil {
-			return Value{}, err
+			if err == io.EOF {
+				if line == "" {
+					return NullValue(), nil
+				}
+				// return last partial line
+				return StringValue(strings.TrimRight(line, "\r\n")), nil
+			}
+			return Value{}, i.runtimeErr(callSpan, fmt.Sprintf("lineinput() failed: %v", err))
 		}
-		if idx < 0 || idx >= len(args[0].Arr.Elems) {
-			return Value{}, i.runtimeErr(callSpan, fmt.Sprintf("remove() index out of bounds (index %d, size %d)", idx, len(args[0].Arr.Elems)))
-		}
-		removed := args[0].Arr.Elems[idx]
-		args[0].Arr.Elems = append(args[0].Arr.Elems[:idx], args[0].Arr.Elems[idx+1:]...)
-		return removed, nil
+		return StringValue(strings.TrimRight(line, "\r\n")), nil
 
-	// Input
+	case "eof":
+		// eof(handle) -> bool
+		if len(args) != 1 || args[0].Kind != ValNumber {
+			return Value{}, i.runtimeErr(callSpan, "eof() expects 1 number arg: eof(handle)")
+		}
+		h := int(args[0].Number)
+		if args[0].Number != float64(h) || h <= 0 {
+			return Value{}, i.runtimeErr(callSpan, "eof() handle must be a positive integer")
+		}
+
+		// per your preference: if not open, treat as EOF=true
+		if _, ok := i.files[h]; !ok || i.files[h] == nil {
+			return BoolValue(true), nil
+		}
+
+		r, _, herr := i.getHandleReader(h)
+		if herr != nil {
+			return BoolValue(true), nil
+		}
+
+		_, err := r.Peek(1)
+		if err == io.EOF {
+			return BoolValue(true), nil
+		}
+		if err != nil {
+			return Value{}, i.runtimeErr(callSpan, fmt.Sprintf("eof() failed: %v", err))
+		}
+		return BoolValue(false), nil
+
+	// Input (stdin)
 	case "input":
 		if len(args) > 1 {
 			return Value{}, i.runtimeErr(callSpan, "input() expects 0 or 1 args")
@@ -1356,65 +1559,6 @@ func (i *Interpreter) evalBuiltin(name string, argExprs []ast.Expr, callSpan ast
 		}
 		line, _ := i.in.ReadString('\n')
 		return StringValue(strings.TrimRight(line, "\r\n")), nil
-
-	// File I/O
-	case "writefile":
-		if len(args) != 2 {
-			return Value{}, i.runtimeErr(callSpan, "writefile() expects 2 args: writefile(path, contents)")
-		}
-		if args[0].Kind != ValString {
-			return Value{}, i.runtimeErr(callSpan, "writefile() path must be a string")
-		}
-		if err := os.WriteFile(args[0].Str, []byte(args[1].ToString()), 0644); err != nil {
-			return Value{}, i.runtimeErr(callSpan, fmt.Sprintf("writefile() failed: %v", err))
-		}
-		return NullValue(), nil
-
-	case "appendfile":
-		if len(args) != 2 {
-			return Value{}, i.runtimeErr(callSpan, "appendfile() expects 2 args: appendfile(path, contents)")
-		}
-		if args[0].Kind != ValString {
-			return Value{}, i.runtimeErr(callSpan, "appendfile() path must be a string")
-		}
-		f, err := os.OpenFile(args[0].Str, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-		if err != nil {
-			return Value{}, i.runtimeErr(callSpan, fmt.Sprintf("appendfile() failed: %v", err))
-		}
-		defer f.Close()
-		if _, err := f.WriteString(args[1].ToString()); err != nil {
-			return Value{}, i.runtimeErr(callSpan, fmt.Sprintf("appendfile() failed: %v", err))
-		}
-		return NullValue(), nil
-
-	case "readfile":
-		if len(args) != 1 {
-			return Value{}, i.runtimeErr(callSpan, "readfile() expects 1 arg: readfile(path)")
-		}
-		if args[0].Kind != ValString {
-			return Value{}, i.runtimeErr(callSpan, "readfile() path must be a string")
-		}
-		data, err := os.ReadFile(args[0].Str)
-		if err != nil {
-			return Value{}, i.runtimeErr(callSpan, fmt.Sprintf("readfile() failed: %v", err))
-		}
-		return StringValue(string(data)), nil
-
-	case "exists":
-		if len(args) != 1 {
-			return Value{}, i.runtimeErr(callSpan, "exists() expects 1 arg: exists(path)")
-		}
-		if args[0].Kind != ValString {
-			return Value{}, i.runtimeErr(callSpan, "exists() path must be a string")
-		}
-		_, err := os.Stat(args[0].Str)
-		if err == nil {
-			return BoolValue(true), nil
-		}
-		if os.IsNotExist(err) {
-			return BoolValue(false), nil
-		}
-		return Value{}, i.runtimeErr(callSpan, fmt.Sprintf("exists() failed: %v", err))
 	}
 
 	return Value{}, i.runtimeErr(callSpan, fmt.Sprintf("Undefined function %q", name))
