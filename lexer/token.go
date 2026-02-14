@@ -26,6 +26,15 @@ const (
 	TRUE     TokenType = "TRUE"
 	FALSE    TokenType = "FALSE"
 
+	// Loop control
+	BREAK    TokenType = "BREAK"
+	CONTINUE TokenType = "CONTINUE"
+
+	// ForEach sugar (support both "foreach" and "for each ... in ...")
+	FOREACH TokenType = "FOREACH"
+	EACH    TokenType = "EACH"
+	IN      TokenType = "IN"
+
 	// Modules
 	IMPORT TokenType = "IMPORT"
 
@@ -106,6 +115,20 @@ func LookupIdent(ident string) TokenType {
 		return TRUE
 	case "false", "FALSE", "False":
 		return FALSE
+
+	// Loop control
+	case "break", "BREAK", "Break":
+		return BREAK
+	case "continue", "CONTINUE", "Continue":
+		return CONTINUE
+
+	// ForEach sugar (both styles)
+	case "foreach", "FOREACH", "Foreach", "forEach", "ForEach":
+		return FOREACH
+	case "each", "EACH", "Each":
+		return EACH
+	case "in", "IN", "In":
+		return IN
 
 	// Modules
 	case "import", "IMPORT", "Import":

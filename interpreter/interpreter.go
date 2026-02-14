@@ -137,6 +137,14 @@ type ReturnSignal struct {
 
 func (r ReturnSignal) Error() string { return "return" }
 
+type BreakSignal struct{}
+
+func (b BreakSignal) Error() string { return "break" }
+
+type ContinueSignal struct{}
+
+func (c ContinueSignal) Error() string { return "continue" }
+
 type RuntimeError struct {
 	File  string
 	Span  ast.Span
@@ -197,6 +205,9 @@ type Interpreter struct {
 
 	callStack []string
 
+	// Loop tracking (for validating break/continue usage)
+	loopDepth int
+
 	// Modules: resolved absolute-ish path -> state (loading/loaded)
 	modules map[string]moduleState
 
@@ -213,6 +224,7 @@ func NewWithSource(filename string, source string) *Interpreter {
 		filename:    filename,
 		lines:       splitLinesPreserve(source),
 		callStack:   []string{},
+		loopDepth:   0,
 		modules:     map[string]moduleState{},
 		moduleStack: []string{},
 	}
@@ -246,7 +258,14 @@ func (i *Interpreter) popLocals()  { i.locals = i.locals[:len(i.locals)-1] }
 func (i *Interpreter) Run(stmts []ast.Stmt) error {
 	for _, s := range stmts {
 		if err := i.execStmt(s); err != nil {
+			// Propagate control-flow signals upward so loops can catch them.
 			if _, ok := err.(ReturnSignal); ok {
+				return err
+			}
+			if _, ok := err.(BreakSignal); ok {
+				return err
+			}
+			if _, ok := err.(ContinueSignal); ok {
 				return err
 			}
 			return err
@@ -308,6 +327,18 @@ func (i *Interpreter) execStmt(s ast.Stmt) error {
 		}
 		return ReturnSignal{Val: val}
 
+	case *ast.BreakStmt:
+		if i.loopDepth <= 0 {
+			return i.runtimeErr(stmt.GetSpan(), "break is only valid inside a loop")
+		}
+		return BreakSignal{}
+
+	case *ast.ContinueStmt:
+		if i.loopDepth <= 0 {
+			return i.runtimeErr(stmt.GetSpan(), "continue is only valid inside a loop")
+		}
+		return ContinueSignal{}
+
 	case *ast.AssignStmt:
 		val, err := i.evalExpr(stmt.Value)
 		if err != nil {
@@ -345,6 +376,9 @@ func (i *Interpreter) execStmt(s ast.Stmt) error {
 		return i.Run(stmt.Else)
 
 	case *ast.WhileStmt:
+		i.loopDepth++
+		defer func() { i.loopDepth-- }()
+
 		for {
 			cond, err := i.evalExpr(stmt.Condition)
 			if err != nil {
@@ -356,14 +390,28 @@ func (i *Interpreter) execStmt(s ast.Stmt) error {
 			if !cond.Bool {
 				break
 			}
-			if err := i.Run(stmt.Body); err != nil {
-				return err
+
+			err = i.Run(stmt.Body)
+			if err != nil {
+				switch err.(type) {
+				case BreakSignal:
+					return nil
+				case ContinueSignal:
+					continue
+				case ReturnSignal:
+					return err
+				default:
+					return err
+				}
 			}
 		}
 		return nil
 
 	case *ast.ForStmt:
 		return i.execFor(stmt)
+
+	case *ast.ForEachStmt:
+		return i.execForEach(stmt)
 
 	default:
 		span, ok := ast.SpanOf(s)
@@ -380,9 +428,6 @@ func (i *Interpreter) fileExists(p string) bool {
 }
 
 func (i *Interpreter) projectRootCandidates() []string {
-	// Minimal, predictable “project root” approach:
-	// - current working directory
-	// We deliberately avoid “walk up parents” (can be surprising).
 	return []string{"."}
 }
 
@@ -392,14 +437,12 @@ func (i *Interpreter) importCandidates(raw string, importerFilename string) []st
 		return []string{}
 	}
 
-	// If the user omitted .bpl, we'll try both.
 	withExt := raw
 	needsExt := filepath.Ext(raw) == ""
 	if needsExt {
 		withExt = raw + ".bpl"
 	}
 
-	// If absolute path:
 	if filepath.IsAbs(raw) {
 		cands := []string{filepath.Clean(raw)}
 		if needsExt {
@@ -408,9 +451,6 @@ func (i *Interpreter) importCandidates(raw string, importerFilename string) []st
 		return cands
 	}
 
-	// Relative path:
-	// 1) Resolve relative to the importing file’s directory (best UX)
-	// 2) Also allow a lib/ fallback relative to that directory
 	baseDir := ""
 	if importerFilename != "" {
 		baseDir = filepath.Dir(importerFilename)
@@ -418,35 +458,30 @@ func (i *Interpreter) importCandidates(raw string, importerFilename string) []st
 
 	cands := []string{}
 
-	// (a) relative to importer directory
 	if baseDir != "" {
 		cands = append(cands, filepath.Clean(filepath.Join(baseDir, raw)))
 		if needsExt {
 			cands = append(cands, filepath.Clean(filepath.Join(baseDir, withExt)))
 		}
 
-		// (b) lib/ relative to importer directory
 		cands = append(cands, filepath.Clean(filepath.Join(baseDir, "lib", raw)))
 		if needsExt {
 			cands = append(cands, filepath.Clean(filepath.Join(baseDir, "lib", withExt)))
 		}
 	}
 
-	// (c) relative to project root candidates (cwd)
 	for _, root := range i.projectRootCandidates() {
 		cands = append(cands, filepath.Clean(filepath.Join(root, raw)))
 		if needsExt {
 			cands = append(cands, filepath.Clean(filepath.Join(root, withExt)))
 		}
 
-		// (d) lib/ relative to project root candidates
 		cands = append(cands, filepath.Clean(filepath.Join(root, "lib", raw)))
 		if needsExt {
 			cands = append(cands, filepath.Clean(filepath.Join(root, "lib", withExt)))
 		}
 	}
 
-	// De-dup while preserving order
 	seen := map[string]bool{}
 	out := []string{}
 	for _, c := range cands {
@@ -476,11 +511,6 @@ func (i *Interpreter) resolveImportPath(raw string, importerFilename string) (st
 }
 
 func (i *Interpreter) circularImportMessage(target string) string {
-	// Build something like:
-	// Circular import detected:
-	//   a.bpl
-	//   b.bpl
-	//   a.bpl
 	var b strings.Builder
 	b.WriteString("Circular import detected:\n")
 	for _, p := range i.moduleStack {
@@ -494,13 +524,10 @@ func (i *Interpreter) circularImportMessage(target string) string {
 }
 
 func (i *Interpreter) execImport(stmt *ast.ImportStmt) error {
-	// IMPORTANT: use the *current executing file* as the importer context
-	// so imports inside modules resolve relative to that module.
 	importerFile := i.filename
 
 	resolved, tried := i.resolveImportPath(stmt.Path, importerFile)
 
-	// Detect circular imports (loading -> import again)
 	switch i.modules[resolved] {
 	case modLoaded:
 		return nil
@@ -508,7 +535,6 @@ func (i *Interpreter) execImport(stmt *ast.ImportStmt) error {
 		return i.runtimeErr(stmt.GetSpan(), i.circularImportMessage(resolved))
 	}
 
-	// If file doesn't exist, provide useful info.
 	if !i.fileExists(resolved) {
 		msg := fmt.Sprintf("import failed: file not found %q", stmt.Path)
 		if len(tried) > 0 {
@@ -526,7 +552,6 @@ func (i *Interpreter) execImport(stmt *ast.ImportStmt) error {
 		return i.runtimeErr(stmt.GetSpan(), fmt.Sprintf("import failed for %q: %v", resolved, err))
 	}
 
-	// Parse module
 	lx := lexer.New(string(data))
 	p := parser.New(lx)
 	prog, err := p.ParseProgram()
@@ -534,11 +559,9 @@ func (i *Interpreter) execImport(stmt *ast.ImportStmt) error {
 		return err
 	}
 
-	// Mark as loading and push stack for circular diagnostics
 	i.modules[resolved] = modLoading
 	i.moduleStack = append(i.moduleStack, resolved)
 
-	// Execute module with correct source context for runtime error lines
 	prevFile := i.filename
 	prevLines := i.lines
 
@@ -547,20 +570,16 @@ func (i *Interpreter) execImport(stmt *ast.ImportStmt) error {
 
 	runErr := i.Run(prog)
 
-	// Restore previous source context
 	i.filename = prevFile
 	i.lines = prevLines
 
-	// Pop module stack
 	i.moduleStack = i.moduleStack[:len(i.moduleStack)-1]
 
-	// If module failed, do NOT cache it as loaded
 	if runErr != nil {
 		i.modules[resolved] = modNone
 		return runErr
 	}
 
-	// Success: cache as loaded
 	i.modules[resolved] = modLoaded
 	return nil
 }
@@ -581,7 +600,6 @@ func (i *Interpreter) execIndexAssign(stmt *ast.IndexAssignStmt) error {
 		return err
 	}
 
-	// Array assignment
 	if containerVal.Kind == ValArray && containerVal.Arr != nil {
 		idx, err := i.toIndex(iv, stmt.Index.GetSpan())
 		if err != nil {
@@ -598,7 +616,6 @@ func (i *Interpreter) execIndexAssign(stmt *ast.IndexAssignStmt) error {
 		return nil
 	}
 
-	// Map assignment
 	if containerVal.Kind == ValMap && containerVal.Map != nil {
 		if iv.Kind != ValString {
 			return i.runtimeErr(stmt.Index.GetSpan(), "Map key must be a string")
@@ -641,6 +658,9 @@ func (i *Interpreter) execFor(stmt *ast.ForStmt) error {
 		step = -1
 	}
 
+	i.loopDepth++
+	defer func() { i.loopDepth-- }()
+
 	i.currentEnv()[stmt.Var] = NumberValue(startV.Number)
 
 	for {
@@ -653,13 +673,99 @@ func (i *Interpreter) execFor(stmt *ast.ForStmt) error {
 		if (step > 0 && cur > endV.Number) || (step < 0 && cur < endV.Number) {
 			break
 		}
-		if err := i.Run(stmt.Body); err != nil {
-			return err
+
+		err := i.Run(stmt.Body)
+		if err != nil {
+			switch err.(type) {
+			case BreakSignal:
+				return nil
+			case ContinueSignal:
+				i.currentEnv()[stmt.Var] = NumberValue(cur + step)
+				continue
+			case ReturnSignal:
+				return err
+			default:
+				return err
+			}
 		}
+
 		i.currentEnv()[stmt.Var] = NumberValue(cur + step)
 	}
 
 	return nil
+}
+
+func (i *Interpreter) execForEach(stmt *ast.ForEachStmt) error {
+	iter, err := i.evalExpr(stmt.Iterable)
+	if err != nil {
+		return err
+	}
+
+	i.loopDepth++
+	defer func() { i.loopDepth-- }()
+
+	// foreach over array
+	if iter.Kind == ValArray && iter.Arr != nil {
+		for idx, v := range iter.Arr.Elems {
+			i.currentEnv()[stmt.Var] = v
+			if stmt.IndexVar != "" {
+				i.currentEnv()[stmt.IndexVar] = NumberValue(float64(idx))
+			}
+
+			err := i.Run(stmt.Body)
+			if err != nil {
+				switch err.(type) {
+				case BreakSignal:
+					return nil
+				case ContinueSignal:
+					continue
+				case ReturnSignal:
+					return err
+				default:
+					return err
+				}
+			}
+		}
+		return nil
+	}
+
+	// foreach over map (stable key order)
+	if iter.Kind == ValMap && iter.Map != nil {
+		m := iter.Map.Elems
+		keys := make([]string, 0, len(m))
+		for k := range m {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+
+		for idx, k := range keys {
+			// VALUE var gets key (matches your demo output: a b c)
+			i.currentEnv()[stmt.Var] = StringValue(k)
+			if stmt.IndexVar != "" {
+				// INDEX var gets value (matches your demo output: a=1 etc when you print key=value)
+				i.currentEnv()[stmt.IndexVar] = m[k]
+			}
+
+			_ = idx // idx intentionally unused here (kept in case you want numeric index later)
+
+			err := i.Run(stmt.Body)
+			if err != nil {
+				switch err.(type) {
+				case BreakSignal:
+					return nil
+				case ContinueSignal:
+					continue
+				case ReturnSignal:
+					return err
+				default:
+					return err
+				}
+			}
+		}
+		return nil
+	}
+
+	return i.runtimeErr(stmt.GetSpan(), "foreach expects an array or map")
 }
 
 func (i *Interpreter) valuesEqual(a, b Value) bool {
@@ -785,7 +891,6 @@ func (i *Interpreter) evalExpr(e ast.Expr) (Value, error) {
 			return Value{}, err
 		}
 
-		// Array indexing
 		if left.Kind == ValArray && left.Arr != nil {
 			idx, err := i.toIndex(iv, expr.Index.GetSpan())
 			if err != nil {
@@ -797,7 +902,6 @@ func (i *Interpreter) evalExpr(e ast.Expr) (Value, error) {
 			return left.Arr.Elems[idx], nil
 		}
 
-		// Map indexing
 		if left.Kind == ValMap && left.Map != nil {
 			if iv.Kind != ValString {
 				return Value{}, i.runtimeErr(expr.Index.GetSpan(), "Map key must be a string")
@@ -887,12 +991,10 @@ func (i *Interpreter) evalExpr(e ast.Expr) (Value, error) {
 		}
 
 		if expr.Op == "+" {
-			// number + number
 			if left.Kind == ValNumber && right.Kind == ValNumber {
 				return NumberValue(left.Number + right.Number), nil
 			}
 
-			// array + array (concat, non-mutating)
 			if left.Kind == ValArray && right.Kind == ValArray {
 				if left.Arr == nil || right.Arr == nil {
 					return Value{}, i.runtimeErr(expr.GetSpan(), "Array concat requires valid arrays")
@@ -903,7 +1005,6 @@ func (i *Interpreter) evalExpr(e ast.Expr) (Value, error) {
 				return ArrayValue(out), nil
 			}
 
-			// fallback: string concat
 			return StringValue(left.ToString() + right.ToString()), nil
 		}
 
@@ -1172,7 +1273,6 @@ func (i *Interpreter) evalBuiltin(name string, argExprs []ast.Expr, callSpan ast
 		if args[0].Kind != ValMap || args[0].Map == nil {
 			return Value{}, i.runtimeErr(callSpan, "clear() expects a map")
 		}
-		// Keep reference semantics: mutate the existing map in place.
 		if args[0].Map.Elems == nil {
 			args[0].Map.Elems = map[string]Value{}
 		} else {

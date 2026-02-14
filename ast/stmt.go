@@ -151,3 +151,23 @@ func (r *ReturnStmt) NodeKind() string { return "ReturnStmt" }
 func (r *ReturnStmt) stmtNode()        {}
 func (r *ReturnStmt) GetSpan() Span    { return r.S }
 func (r *ReturnStmt) String() string   { return fmt.Sprintf("Return(%s)", r.Value.String()) }
+
+// --- Loop control ---
+
+type BreakStmt struct {
+	S Span
+}
+
+func (b *BreakStmt) NodeKind() string { return "BreakStmt" }
+func (b *BreakStmt) stmtNode()        {}
+func (b *BreakStmt) GetSpan() Span    { return b.S }
+func (b *BreakStmt) String() string   { return "Break" }
+
+type ContinueStmt struct {
+	S Span
+}
+
+func (c *ContinueStmt) NodeKind() string { return "ContinueStmt" }
+func (c *ContinueStmt) stmtNode()        {}
+func (c *ContinueStmt) GetSpan() Span    { return c.S }
+func (c *ContinueStmt) String() string   { return "Continue" }
